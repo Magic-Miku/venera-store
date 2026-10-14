@@ -165,17 +165,13 @@ jobs:
           $ErrorActionPreference = "Stop"
           $root = "C:\V\" + (Get-ChildItem "C:\V" -Directory)[0].Name
           Write-Host "payload root = $root"
-          Write-Host "payload 顶层内容:"
-          Get-ChildItem $root -Force | Select-Object -First 10 | ForEach-Object { Write-Host ("  " + $_.Name) }
 
           Write-Host "=== 定位 makeappx.exe ==="
           $mk = $null
           $cands = @(Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
                      Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending)
-          Write-Host ("候选: " + (($cands | ForEach-Object { $_.FullName }) -join "`n        "))
           if ($cands.Count -gt 0) { $mk = $cands[0].FullName }
           if (-not $mk) {
-            # 再试 Program Files
             $cands2 = @(Get-ChildItem "C:\Program Files\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
                         Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending)
             if ($cands2.Count -gt 0) { $mk = $cands2[0].FullName }
@@ -185,7 +181,6 @@ jobs:
 
           # MSIX 版本: <上游 major.minor>.<run_number>.0
           #   商店硬性规则: 第 4 段(Revision) 必须为 0, 否则拒收
-          #   递增由第 3 段(run_number) 保证
           $up = "${{ needs.check.outputs.ver }}"
           $mm = "${{ needs.check.outputs.mm }}"
           $v = "$mm.$env:GITHUB_RUN_NUMBER.0"
@@ -198,6 +193,31 @@ jobs:
           New-Item -ItemType Directory -Force -Path $s | Out-Null
           # 原样复制 payload（不改动任何原版文件）
           Get-ChildItem $root -Force | ForEach-Object { Copy-Item $_.FullName $s -Recurse -Force }
+
+          # VC++ 运行库 app-local 部署
+          # 包内不自带 msvcp140/vcruntime140 等 DLL，商店 MSIX 沙箱里也没有系统级 redist。
+          # 框架依赖 Microsoft.VCLibs.140.00.UWPDesktop 商店不认（报 Neutral/Universal 不可用），
+          # 因此改为把 runner 自带的 VC++ redist DLL 拷到 exe 同目录（微软允许 app-local，只是不推荐）。
+          Write-Host "=== 复制 VC++ 运行库 DLL (app-local) ==="
+          $vcNames = @("msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll","concrt140.dll")
+          $vcSrcs = @(
+            "C:\Windows\System32",
+            "C:\Windows\SysWOW64"
+          )
+          foreach ($d in $vcNames) {
+            $done = $false
+            foreach ($dir in $vcSrcs) {
+              $src = Join-Path $dir $d
+              if (Test-Path $src) {
+                Copy-Item $src (Join-Path $s $d) -Force
+                Write-Host ("  bundled {0}  (from {1})" -f $d, $dir)
+                $done = $true
+                break
+              }
+            }
+            if (-not $done) { Write-Host ("  WARN: {0} not found on runner" -f $d) }
+          }
+
           $staged = @(Get-ChildItem $s -Recurse -File -Force).Count
           Write-Host "staged = $staged"
           if ($staged -lt 50) { throw "staging incomplete: $staged" }
@@ -241,7 +261,6 @@ jobs:
             '  </Properties>'
             '  <Dependencies>'
             '    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" />'
-            '    <PackageDependency Name="Microsoft.VCLibs.140.00.UWPDesktop" MinVersion="14.0.24217.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />'
             '  </Dependencies>'
             '  <Resources>'
             '    <Resource Language="zh-cn" />'
