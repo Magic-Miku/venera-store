@@ -156,13 +156,26 @@ jobs:
       - name: Pack
         id: pack
         run: |
+          $ErrorActionPreference = "Stop"
           $root = "C:\V\" + (Get-ChildItem "C:\V" -Directory)[0].Name
-          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
-          if (-not (Test-Path $mk)) {
-            $mk = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
-                   Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          Write-Host "payload root = $root"
+          Write-Host "payload 顶层内容:"
+          Get-ChildItem $root -Force | Select-Object -First 10 | ForEach-Object { Write-Host ("  " + $_.Name) }
+
+          Write-Host "=== 定位 makeappx.exe ==="
+          $mk = $null
+          $cands = @(Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending)
+          Write-Host ("候选: " + (($cands | ForEach-Object { $_.FullName }) -join "`n        "))
+          if ($cands.Count -gt 0) { $mk = $cands[0].FullName }
+          if (-not $mk) {
+            # 再试 Program Files
+            $cands2 = @(Get-ChildItem "C:\Program Files\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
+                        Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending)
+            if ($cands2.Count -gt 0) { $mk = $cands2[0].FullName }
           }
-          if (-not (Test-Path $mk)) { throw "makeappx not found" }
+          if (-not $mk) { throw "makeappx not found in Windows Kits" }
+          Write-Host "makeappx = $mk"
 
           # MSIX 版本: <上游版本>.<run_number> —— 第 4 段用 run_number 保证单调递增
           $up = "${{ needs.check.outputs.ver }}"
@@ -176,6 +189,7 @@ jobs:
           Get-ChildItem $root -Force | ForEach-Object { Copy-Item $_.FullName $s -Recurse -Force }
           $staged = @(Get-ChildItem $s -Recurse -File -Force).Count
           Write-Host "staged = $staged"
+          if ($staged -lt 50) { throw "staging incomplete: $staged" }
 
           $a = "$s\Assets"
           New-Item -ItemType Directory -Force -Path $a | Out-Null
@@ -216,7 +230,7 @@ jobs:
             '  </Properties>'
             '  <Dependencies>'
             '    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" />'
-            '    <PackageDependency Name="Microsoft.VCLibs.140.00.UWPDesktop" MinVersion="14.0.24217.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, US" />'
+            '    <PackageDependency Name="Microsoft.VCLibs.140.00.UWPDesktop" MinVersion="14.0.24217.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />'
             '  </Dependencies>'
             '  <Resources>'
             '    <Resource Language="zh-cn" />'
@@ -242,7 +256,7 @@ jobs:
             '    <rescap:Capability Name="runFullTrust" />'
             '  </Capabilities>'
             '  <mp:PhoneIdentity PhoneProductId="926903e4-7b05-4c92-b01b-6c25d2f4a335" PhonePublisherId="1bf42279-ce31-40ab-8b3e-fcd19d939971" />'
-            '</Package>'
+          '</Package>'
           )
           [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
 
