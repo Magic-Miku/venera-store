@@ -26,36 +26,55 @@ jobs:
         with:
           fetch-depth: 1
       - id: c
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -o pipefail
           REPO="CyrilPeng/Venera-Next"
-          echo "=== 查询上游最新稳定版 ==="
-          API="https://api.github.com/repos/$REPO/releases/latest"
-          J=$(curl -sSL --max-time 60 --retry 3 -H "Authorization: Bearer $GH_TOKEN" "$API")
-          TAG=$(echo "$J" | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
-          PRE=$(echo "$J" | grep -m1 '"prerelease"' | sed 's/.*"prerelease": *//' | cut -d, -f1)
-          if [ -z "$TAG" ]; then echo "::error::无法获取上游 tag"; exit 1; fi
-          if [ "$PRE" != "false" ]; then echo "::error::latest 是预发布，中止"; exit 1; fi
-          VER="${TAG#v}"
-          echo "tag=$TAG  version=$VER  prerelease=$PRE"
 
-          # 定位 windows.zip 资产
-          ZURL=$(echo "$J" | grep -o '"browser_download_url": *"[^"]*-windows\.zip"' | head -1 | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')
-          ZSIZE=$(echo "$J" | grep -o '"name": *"[^"]*-windows\.zip",[^}]*"size": *[0-9]*' | head -1 | sed 's/.*"size": *//')
-          if [ -z "$ZURL" ]; then echo "::error::未找到 windows.zip 资产"; exit 1; fi
-          echo "zip: $ZURL  ($ZSIZE bytes)"
-
-          # build 号（来自该 tag 的 release.json，仅用于展示）
-          B=$(curl -sSL --max-time 30 "https://raw.githubusercontent.com/$REPO/$TAG/release.json" | grep -o '"build": *[0-9]*' | head -1 | sed 's/.*: *//')
-          [ -z "$B" ] && B="0"
-
-          # 与记录比对
+          echo "=== 第 1 步: 读本地记录 ==="
           O=""
           [ -f .venera-ver ] && O=$(cat .venera-ver | tr -d '\r\n')
-          echo "current = $TAG"
-          echo "recorded= ${O:-（无）}"
+          echo "recorded = ${O:-（无）}"
+
+          echo "=== 第 2 步: 拿最新稳定 tag（重定向，0 API 配额）==="
+          # /releases/latest 会 302 到 /releases/tag/<tag>
+          # GitHub 保证只指向稳定版（自动跳过 prerelease / draft）
+          LOC=$(curl -sSI --max-time 60 --retry 3 \
+                 "https://github.com/$REPO/releases/latest" \
+                 | grep -i '^location:' | tail -1 | tr -d '\r' | sed 's/^[Ll]ocation: *//')
+          echo "location = $LOC"
+          TAG=$(echo "$LOC" | grep -o 'releases/tag/[^/?#]*' | sed 's|releases/tag/||')
+          if [ -z "$TAG" ]; then
+            echo "::error::无法从重定向提取 tag，本次跳过"
+            exit 1
+          fi
+          VER="${TAG#v}"
+          echo "latest tag = $TAG   version = $VER"
+
+          echo "=== 第 3 步: 拼 zip URL（命名规律已验证 23/23 个 release）==="
+          ZIPNAME="VeneraNext-$VER-windows.zip"
+          ZURL="https://github.com/$REPO/releases/download/$TAG/$ZIPNAME"
+          echo "zip = $ZURL"
+
+          echo "=== 第 4 步: HEAD 取大小（0 API 配额）==="
+          ZSIZE=$(curl -sSIL --max-time 60 --retry 3 "$ZURL" \
+                  | grep -i '^content-length:' | tail -1 | tr -d '\r' \
+                  | sed 's/^[Cc]ontent-[Ll]ength: *//')
+          echo "size = ${ZSIZE:-（未取到）} bytes"
+          if [ -z "$ZSIZE" ] || [ "$ZSIZE" -lt 10000000 ]; then
+            echo "::error::zip 大小异常（$ZSIZE），本次跳过"
+            exit 1
+          fi
+
+          echo "=== 第 5 步: build 号（raw 不占配额，仅展示）==="
+          B=$(curl -sSL --max-time 30 --retry 2 \
+              "https://raw.githubusercontent.com/$REPO/$TAG/release.json" \
+              | grep -o '"build": *[0-9]*' | head -1 | sed 's/.*: *//')
+          [ -z "$B" ] && B="0"
+          echo "upstream build = $B"
+
+          echo "=== 第 6 步: 比对 ==="
+          echo "current  = $TAG"
+          echo "recorded = ${O:-（无）}"
           if [ "${{ github.event.inputs.force }}" = "true" ] || [ "$TAG" != "$O" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
@@ -64,7 +83,7 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "ver=$VER" >> $GITHUB_OUTPUT
           echo "zipurl=$ZURL" >> $GITHUB_OUTPUT
-          echo "zipsize=${ZSIZE:-0}" >> $GITHUB_OUTPUT
+          echo "zipsize=$ZSIZE" >> $GITHUB_OUTPUT
           echo "build=$B" >> $GITHUB_OUTPUT
       - name: Heartbeat
         if: always()
@@ -77,7 +96,7 @@ jobs:
           git add .venera-heartbeat
           git diff --cached --quiet && echo "no change" && exit 0
           git commit -m "chore: heartbeat [skip ci]"
-          git pull --rebase --autostash origin master || echo "rebase failed"
+          git pull --rebase --autostash origin main || echo "rebase failed"
           git push || echo "push failed"
       - name: Prune old artifacts
         if: always()
@@ -111,7 +130,7 @@ jobs:
           $f = "$env:RUNNER_TEMP\v.zip"
           Remove-Item $f -Force -ErrorAction SilentlyContinue
           Write-Host "url = $url"
-          curl.exe -L --retry 5 --retry-delay 5 --retry-all-errors --max-time 600 -o $f $url
+          curl.exe -L --retry 5 --retry-delay 5 --retry-all-errors --max-time 900 -o $f $url
           if (-not (Test-Path $f)) { throw "download failed" }
           $sz = (Get-Item $f).Length
           Write-Host "downloaded = $sz bytes (upstream $want)"
@@ -125,7 +144,6 @@ jobs:
           if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path $tmp | Out-Null
           Expand-Archive -Path $f -DestinationPath $tmp -Force
-          # zip 内含单一根目录 VeneraNext-<ver>-windows
           $inner = @(Get-ChildItem $tmp -Directory)
           if ($inner.Count -ne 1) { throw "unexpected zip layout: $($inner.Count) dirs" }
           $root = $inner[0].FullName
@@ -135,8 +153,6 @@ jobs:
           $n = @(Get-ChildItem $root -Recurse -File -Force).Count
           Write-Host "payload files = $n"
           if ($n -lt 50) { throw "too few payload files: $n" }
-          # 记录到 output
-          "root=$root" | Out-File -Append $env:GITHUB_OUTPUT
       - name: Pack
         id: pack
         run: |
@@ -148,7 +164,7 @@ jobs:
           }
           if (-not (Test-Path $mk)) { throw "makeappx not found" }
 
-          # MSIX 版本: <上游版本>.<run_number>  —— 第4段用 run_number 保证单调递增
+          # MSIX 版本: <上游版本>.<run_number> —— 第 4 段用 run_number 保证单调递增
           $up = "${{ needs.check.outputs.ver }}"
           $v = "$up.$env:GITHUB_RUN_NUMBER"
           Write-Host "MSIX version = $v   (upstream $up build ${{ needs.check.outputs.build }})"
@@ -161,7 +177,6 @@ jobs:
           $staged = @(Get-ChildItem $s -Recurse -File -Force).Count
           Write-Host "staged = $staged"
 
-          # 图标
           $a = "$s\Assets"
           New-Item -ItemType Directory -Force -Path $a | Out-Null
           $ic = "$env:GITHUB_WORKSPACE\.github\store-icons"
@@ -227,7 +242,7 @@ jobs:
             '    <rescap:Capability Name="runFullTrust" />'
             '  </Capabilities>'
             '  <mp:PhoneIdentity PhoneProductId="926903e4-7b05-4c92-b01b-6c25d2f4a335" PhonePublisherId="1bf42279-ce31-40ab-8b3e-fcd19d939971" />'
-          '</Package>'
+            '</Package>'
           )
           [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
 
@@ -283,7 +298,7 @@ jobs:
           git add .venera-ver
           git diff --cached --quiet && echo "unchanged" && exit 0
           git commit -m "venera tag [skip ci]"
-          git pull --rebase --autostash origin master || echo "rebase failed"
+          git pull --rebase --autostash origin main || echo "rebase failed"
           git push || echo "push failed"
       - name: Email success
         if: success()
@@ -334,7 +349,7 @@ jobs:
             "上游 tag: ${{ needs.check.outputs.tag }}",
             "",
             "常见原因:",
-            "  1. 上游改了资产命名或 zip 结构",
+            "  1. 上游改了资产命名或 zip 结构（规律失效）",
             "  2. 下载失败或大小不符",
             "  3. makeappx 打包失败",
             "  4. 图标缺失（.github/store-icons/）",
