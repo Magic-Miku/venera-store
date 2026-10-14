@@ -1,0 +1,351 @@
+name: Venera Auto Build
+on:
+  schedule:
+    - cron: '37 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: force build
+        type: boolean
+        default: false
+permissions:
+  contents: write
+  actions: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.c.outputs.changed }}
+      tag: ${{ steps.c.outputs.tag }}
+      ver: ${{ steps.c.outputs.ver }}
+      zipurl: ${{ steps.c.outputs.zipurl }}
+      zipsize: ${{ steps.c.outputs.zipsize }}
+      build: ${{ steps.c.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - id: c
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          REPO="CyrilPeng/Venera-Next"
+          echo "=== 查询上游最新稳定版 ==="
+          API="https://api.github.com/repos/$REPO/releases/latest"
+          J=$(curl -sSL --max-time 60 --retry 3 -H "Authorization: Bearer $GH_TOKEN" "$API")
+          TAG=$(echo "$J" | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+          PRE=$(echo "$J" | grep -m1 '"prerelease"' | sed 's/.*"prerelease": *//' | cut -d, -f1)
+          if [ -z "$TAG" ]; then echo "::error::无法获取上游 tag"; exit 1; fi
+          if [ "$PRE" != "false" ]; then echo "::error::latest 是预发布，中止"; exit 1; fi
+          VER="${TAG#v}"
+          echo "tag=$TAG  version=$VER  prerelease=$PRE"
+
+          # 定位 windows.zip 资产
+          ZURL=$(echo "$J" | grep -o '"browser_download_url": *"[^"]*-windows\.zip"' | head -1 | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')
+          ZSIZE=$(echo "$J" | grep -o '"name": *"[^"]*-windows\.zip",[^}]*"size": *[0-9]*' | head -1 | sed 's/.*"size": *//')
+          if [ -z "$ZURL" ]; then echo "::error::未找到 windows.zip 资产"; exit 1; fi
+          echo "zip: $ZURL  ($ZSIZE bytes)"
+
+          # build 号（来自该 tag 的 release.json，仅用于展示）
+          B=$(curl -sSL --max-time 30 "https://raw.githubusercontent.com/$REPO/$TAG/release.json" | grep -o '"build": *[0-9]*' | head -1 | sed 's/.*: *//')
+          [ -z "$B" ] && B="0"
+
+          # 与记录比对
+          O=""
+          [ -f .venera-ver ] && O=$(cat .venera-ver | tr -d '\r\n')
+          echo "current = $TAG"
+          echo "recorded= ${O:-（无）}"
+          if [ "${{ github.event.inputs.force }}" = "true" ] || [ "$TAG" != "$O" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "ver=$VER" >> $GITHUB_OUTPUT
+          echo "zipurl=$ZURL" >> $GITHUB_OUTPUT
+          echo "zipsize=${ZSIZE:-0}" >> $GITHUB_OUTPUT
+          echo "build=$B" >> $GITHUB_OUTPUT
+      - name: Heartbeat
+        if: always()
+        continue-on-error: true
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          printf '%s | tag=%s | changed=%s\n' "$TS" "${{ steps.c.outputs.tag }}" "${{ steps.c.outputs.changed }}" > .venera-heartbeat
+          git add .venera-heartbeat
+          git diff --cached --quiet && echo "no change" && exit 0
+          git commit -m "chore: heartbeat [skip ci]"
+          git pull --rebase --autostash origin master || echo "rebase failed"
+          git push || echo "push failed"
+      - name: Prune old artifacts
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[] | "\(.id)"' > /tmp/a.txt || true
+          while read -r ID; do
+            [ -z "$ID" ] && continue
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$ID" || true
+          done < /tmp/a.txt
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '"剩余 \(.total_count) 个"'
+  build:
+    needs: [check]
+    if: needs.check.outputs.changed == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Download upstream windows zip
+        run: |
+          $url = "${{ needs.check.outputs.zipurl }}"
+          $want = [int64]"${{ needs.check.outputs.zipsize }}"
+          $f = "$env:RUNNER_TEMP\v.zip"
+          Remove-Item $f -Force -ErrorAction SilentlyContinue
+          Write-Host "url = $url"
+          curl.exe -L --retry 5 --retry-delay 5 --retry-all-errors --max-time 600 -o $f $url
+          if (-not (Test-Path $f)) { throw "download failed" }
+          $sz = (Get-Item $f).Length
+          Write-Host "downloaded = $sz bytes (upstream $want)"
+          if ($sz -lt 10MB) { throw "too small: $sz" }
+          if ($want -gt 0 -and $sz -ne $want) { throw "size mismatch: $sz vs $want" }
+          Write-Host "download OK"
+      - name: Extract payload
+        run: |
+          $f = "$env:RUNNER_TEMP\v.zip"
+          $tmp = "C:\V"
+          if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          Expand-Archive -Path $f -DestinationPath $tmp -Force
+          # zip 内含单一根目录 VeneraNext-<ver>-windows
+          $inner = @(Get-ChildItem $tmp -Directory)
+          if ($inner.Count -ne 1) { throw "unexpected zip layout: $($inner.Count) dirs" }
+          $root = $inner[0].FullName
+          Write-Host "payload root = $root"
+          $exe = Join-Path $root "VeneraNext.exe"
+          if (-not (Test-Path $exe)) { throw "VeneraNext.exe not found" }
+          $n = @(Get-ChildItem $root -Recurse -File -Force).Count
+          Write-Host "payload files = $n"
+          if ($n -lt 50) { throw "too few payload files: $n" }
+          # 记录到 output
+          "root=$root" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: Pack
+        id: pack
+        run: |
+          $root = "C:\V\" + (Get-ChildItem "C:\V" -Directory)[0].Name
+          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
+          if (-not (Test-Path $mk)) {
+            $mk = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          }
+          if (-not (Test-Path $mk)) { throw "makeappx not found" }
+
+          # MSIX 版本: <上游版本>.<run_number>  —— 第4段用 run_number 保证单调递增
+          $up = "${{ needs.check.outputs.ver }}"
+          $v = "$up.$env:GITHUB_RUN_NUMBER"
+          Write-Host "MSIX version = $v   (upstream $up build ${{ needs.check.outputs.build }})"
+
+          $s = "C:\S"
+          if (Test-Path $s) { Remove-Item $s -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path $s | Out-Null
+          # 原样复制 payload（不改动任何原版文件）
+          Get-ChildItem $root -Force | ForEach-Object { Copy-Item $_.FullName $s -Recurse -Force }
+          $staged = @(Get-ChildItem $s -Recurse -File -Force).Count
+          Write-Host "staged = $staged"
+
+          # 图标
+          $a = "$s\Assets"
+          New-Item -ItemType Directory -Force -Path $a | Out-Null
+          $ic = "$env:GITHUB_WORKSPACE\.github\store-icons"
+          $zip = Join-Path $ic "appx-icons.zip"
+          if (Test-Path $zip) {
+            Expand-Archive -Path $zip -DestinationPath $a -Force
+            Write-Host "icons from appx-icons.zip"
+          } else {
+            Get-ChildItem $ic -File -Filter *.png -ErrorAction SilentlyContinue |
+              ForEach-Object { Copy-Item $_.FullName (Join-Path $a $_.Name) -Force }
+            Write-Host "icons from individual png"
+          }
+          $iconN = @(Get-ChildItem $a -Recurse -File -Force).Count
+          Write-Host "icons = $iconN"
+          if ($iconN -lt 40) { throw "too few icons: $iconN" }
+          foreach ($n in @("StoreLogo.png","Square44x44Logo.png","Square150x150Logo.png","Square310x310Logo.png","Square71x71Logo.png","Wide310x150Logo.png","SplashScreen.png","BadgeLogo.png","AppList.png")) {
+            if (-not (Test-Path (Join-Path $a $n))) { throw "required icon missing: $n" }
+          }
+          foreach ($t in @(16,20,24,30,32,36,40,48,60,64,72,80,96,256)) {
+            foreach ($suf in @("","_altform-unplated","_altform-lightunplated")) {
+              $fn = "AppList.targetsize-$t$suf.png"
+              if (-not (Test-Path (Join-Path $a $fn))) { throw "AppList targetsize missing: $fn" }
+            }
+          }
+          Write-Host "all AppList targetsize assets present (14 sizes x 3 themes)"
+
+          $pdn = [char]0xD835 + [char]0xDD78 + 'ik' + [char]0x0E19 + [char]0x795E + [char]0x6559 + [char]0x2728 + [char]0x6559 + [char]0x4E3B
+          $x = @(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap" xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest">'
+            ('  <Identity Name="14714BE0.Venera" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" />')
+            '  <Properties>'
+            '    <DisplayName>Venera漫画</DisplayName>'
+            ('    <PublisherDisplayName>' + $pdn + '</PublisherDisplayName>')
+            '    <Description>Venera漫画 - 跨平台漫画阅读器，支持本地漫画、WebDAV 与网络漫画源</Description>'
+            '    <Logo>Assets\StoreLogo.png</Logo>'
+            '  </Properties>'
+            '  <Dependencies>'
+            '    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" />'
+            '    <PackageDependency Name="Microsoft.VCLibs.140.00.UWPDesktop" MinVersion="14.0.24217.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, US" />'
+            '  </Dependencies>'
+            '  <Resources>'
+            '    <Resource Language="zh-cn" />'
+            '    <Resource Language="en-us" />'
+            '  </Resources>'
+            '  <Applications>'
+            '    <Application Id="App" Executable="VeneraNext.exe" EntryPoint="Windows.FullTrustApplication">'
+            '      <uap:VisualElements DisplayName="Venera漫画" Description="Venera漫画 - 跨平台漫画阅读器" BackgroundColor="#15293D" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">'
+            '        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square310x310Logo="Assets\Square310x310Logo.png" Square71x71Logo="Assets\Square71x71Logo.png">'
+            '          <uap:ShowNameOnTiles>'
+            '            <uap:ShowOn Tile="square150x150Logo" />'
+            '            <uap:ShowOn Tile="wide310x150Logo" />'
+            '            <uap:ShowOn Tile="square310x310Logo" />'
+            '          </uap:ShowNameOnTiles>'
+            '        </uap:DefaultTile>'
+            '        <uap:SplashScreen Image="Assets\SplashScreen.png" />'
+            '        <uap:LockScreen BadgeLogo="Assets\BadgeLogo.png" Notification="badgeAndTileText" />'
+            '      </uap:VisualElements>'
+            '    </Application>'
+            '  </Applications>'
+            '  <Capabilities>'
+            '    <Capability Name="internetClient" />'
+            '    <rescap:Capability Name="runFullTrust" />'
+            '  </Capabilities>'
+            '  <mp:PhoneIdentity PhoneProductId="926903e4-7b05-4c92-b01b-6c25d2f4a335" PhonePublisherId="1bf42279-ce31-40ab-8b3e-fcd19d939971" />'
+          '</Package>'
+          )
+          [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
+
+          $out = "C:\out"
+          if (Test-Path $out) { Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          & $mk pack /d $s /p "$out\v.appx" /o 2>&1 | Tee-Object v.log
+          if (-not (Test-Path "$out\v.appx")) { Get-Content v.log | Select-Object -Last 8; throw "pack failed" }
+          $mb = [math]::Round((Get-Item "$out\v.appx").Length/1MB,1)
+          Write-Host "*** OK $mb MB ver=$v ***"
+          if ($mb -lt 10) { throw "too small: $mb MB" }
+          if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          Copy-Item "$out\v.appx" "dist\Venera.msix" -Force
+          "ver=$v" | Out-File -Append $env:GITHUB_OUTPUT
+          "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
+          "icons=$iconN" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: Publish Release (latest)
+        id: rel
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $tag = "latest"
+          $v = "${{ steps.pack.outputs.ver }}"
+          $up = "${{ needs.check.outputs.ver }}"
+          gh release delete $tag --repo $repo --yes --cleanup-tag 2>$null
+          gh release create $tag "dist\Venera.msix" `
+            --repo $repo `
+            --title "Venera漫画 $up（MSIX $v）" `
+            --notes "上游版本: $up (build ${{ needs.check.outputs.build }})`nMSIX 版本: $v`nicons: ${{ steps.pack.outputs.icons }}`nfrom: CyrilPeng/Venera-Next"
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          $url = "https://github.com/$repo/releases/download/$tag/Venera.msix"
+          Write-Host "DIRECT URL = $url"
+          "url=$url" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: Upload artifact (fallback only)
+        if: steps.rel.outcome != 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: venera-msix
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Save version
+        if: success()
+        continue-on-error: true
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          echo "${{ needs.check.outputs.tag }}" > .venera-ver
+          git add .venera-ver
+          git diff --cached --quiet && echo "unchanged" && exit 0
+          git commit -m "venera tag [skip ci]"
+          git pull --rebase --autostash origin master || echo "rebase failed"
+          git push || echo "push failed"
+      - name: Email success
+        if: success()
+        shell: pwsh
+        run: |
+          $url = "${{ steps.rel.outputs.url }}"
+          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if (-not $url) { $url = "(Release 未生成，请到 Actions 页下载 artifact)`n$runUrl" }
+          $L = @(
+            "Venera漫画 新包已构建完成。",
+            "",
+            "上游版本: ${{ needs.check.outputs.tag }} (build ${{ needs.check.outputs.build }})",
+            "MSIX 版本: ${{ steps.pack.outputs.ver }}",
+            "大小: ${{ steps.pack.outputs.mb }} MB",
+            "图标: ${{ steps.pack.outputs.icons }} 个（含全部 targetsize 三主题）",
+            "",
+            "===== 第 1 步：下载 =====",
+            "",
+            "点这个链接（浏览器立即开始下载，永远是最新版）：",
+            "",
+            $url,
+            "",
+            "===== 第 2 步：上传商店 =====",
+            "",
+            "打开下面链接（直达 Venera漫画 页面）：",
+            "https://partner.microsoft.com/zh-cn/dashboard/products/9P8TVBWFVX8Z/overview",
+            "",
+            "然后：",
+            "  1. 点右上角的【更新】按钮",
+            "  2. 上传刚下载的 Venera.msix",
+            "  3. 提交认证（约 3 个工作日）",
+            "",
+            "-- GitHub Actions 自动发送"
+          )
+          $body = $L -join "`r`n"
+          $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
+          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[Venera] 新版本已就绪，可以发布到商店了" -Body $body -Encoding UTF8 -Credential $cred
+          Write-Host "success mail sent"
+      - name: Email failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $L = @(
+            "Venera 自动构建失败了，需要你检查一下。",
+            "",
+            "上游 tag: ${{ needs.check.outputs.tag }}",
+            "",
+            "常见原因:",
+            "  1. 上游改了资产命名或 zip 结构",
+            "  2. 下载失败或大小不符",
+            "  3. makeappx 打包失败",
+            "  4. 图标缺失（.github/store-icons/）",
+            "",
+            "查看日志:",
+            $runUrl,
+            "",
+            "-- GitHub Actions 自动发送"
+          )
+          $body = $L -join "`r`n"
+          $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
+          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[Venera] 构建失败，需要检查" -Body $body -Encoding UTF8 -Credential $cred
+          Write-Host "failure mail sent"
