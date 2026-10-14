@@ -18,6 +18,7 @@ jobs:
       changed: ${{ steps.c.outputs.changed }}
       tag: ${{ steps.c.outputs.tag }}
       ver: ${{ steps.c.outputs.ver }}
+      mm: ${{ steps.c.outputs.mm }}
       zipurl: ${{ steps.c.outputs.zipurl }}
       zipsize: ${{ steps.c.outputs.zipsize }}
       build: ${{ steps.c.outputs.build }}
@@ -49,6 +50,10 @@ jobs:
           fi
           VER="${TAG#v}"
           echo "latest tag = $TAG   version = $VER"
+          # 商店硬性规则: MSIX 版本第 4 段(Revision) 必须为 0
+          # 所以取上游 major.minor 作为前两段, 第 3 段用 run_number 保证递增
+          MM=$(echo "$VER" | cut -d. -f1,2)
+          echo "major.minor = $MM"
 
           echo "=== 第 3 步: 拼 zip URL（命名规律已验证 23/23 个 release）==="
           ZIPNAME="VeneraNext-$VER-windows.zip"
@@ -82,6 +87,7 @@ jobs:
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "ver=$VER" >> $GITHUB_OUTPUT
+          echo "mm=$MM" >> $GITHUB_OUTPUT
           echo "zipurl=$ZURL" >> $GITHUB_OUTPUT
           echo "zipsize=$ZSIZE" >> $GITHUB_OUTPUT
           echo "build=$B" >> $GITHUB_OUTPUT
@@ -177,10 +183,15 @@ jobs:
           if (-not $mk) { throw "makeappx not found in Windows Kits" }
           Write-Host "makeappx = $mk"
 
-          # MSIX 版本: <上游版本>.<run_number> —— 第 4 段用 run_number 保证单调递增
+          # MSIX 版本: <上游 major.minor>.<run_number>.0
+          #   商店硬性规则: 第 4 段(Revision) 必须为 0, 否则拒收
+          #   递增由第 3 段(run_number) 保证
           $up = "${{ needs.check.outputs.ver }}"
-          $v = "$up.$env:GITHUB_RUN_NUMBER"
+          $mm = "${{ needs.check.outputs.mm }}"
+          $v = "$mm.$env:GITHUB_RUN_NUMBER.0"
           Write-Host "MSIX version = $v   (upstream $up build ${{ needs.check.outputs.build }})"
+          if ($v.Split('.').Count -ne 4) { throw "bad version format: $v" }
+          if ($v.Split('.')[3] -ne "0") { throw "revision must be 0: $v" }
 
           $s = "C:\S"
           if (Test-Path $s) { Remove-Item $s -Recurse -Force -ErrorAction SilentlyContinue }
