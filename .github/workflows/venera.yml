@@ -293,14 +293,30 @@ jobs:
           $out = "C:\out"
           if (Test-Path $out) { Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          # 第 1 步: pack 成 .msix
           & $mk pack /d $s /p "$out\v.appx" /o 2>&1 | Tee-Object v.log
           if (-not (Test-Path "$out\v.appx")) { Get-Content v.log | Select-Object -Last 8; throw "pack failed" }
-          $mb = [math]::Round((Get-Item "$out\v.appx").Length/1MB,1)
-          Write-Host "*** OK $mb MB ver=$v ***"
-          if ($mb -lt 10) { throw "too small: $mb MB" }
+          $msixMB = [math]::Round((Get-Item "$out\v.appx").Length/1MB,1)
+          Write-Host "*** msix OK $msixMB MB ver=$v ***"
+
+          # 第 2 步: bundle 成 .msixbundle
+          # 商店要求: 此应用上次提交用的是 msixbundle, 后续必须继续用 bundle
+          # 官方命令: makeappx bundle /d <dir> /p <out>.msixbundle
+          Write-Host "=== 打包 .msixbundle ==="
+          $bd = "C:\B"
+          if (Test-Path $bd) { Remove-Item $bd -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path $bd | Out-Null
+          Copy-Item "$out\v.appx" (Join-Path $bd "Venera.msix") -Force
+          & $mk bundle /d $bd /p "$out\v.msixbundle" /o 2>&1 | Tee-Object b.log
+          if (-not (Test-Path "$out\v.msixbundle")) { Get-Content b.log | Select-Object -Last 8; throw "bundle failed" }
+          $mb = [math]::Round((Get-Item "$out\v.msixbundle").Length/1MB,1)
+          Write-Host "*** bundle OK $mb MB ver=$v ***"
+          if ($mb -lt 10) { throw "bundle too small: $mb MB" }
+
           if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
-          Copy-Item "$out\v.appx" "dist\Venera.msix" -Force
+          Copy-Item "$out\v.msixbundle" "dist\Venera.msixbundle" -Force
           "ver=$v" | Out-File -Append $env:GITHUB_OUTPUT
           "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
           "icons=$iconN" | Out-File -Append $env:GITHUB_OUTPUT
@@ -316,19 +332,19 @@ jobs:
           $v = "${{ steps.pack.outputs.ver }}"
           $up = "${{ needs.check.outputs.ver }}"
           gh release delete $tag --repo $repo --yes --cleanup-tag 2>$null
-          gh release create $tag "dist\Venera.msix" `
+          gh release create $tag "dist\Venera.msixbundle" `
             --repo $repo `
             --title "Venera漫画 $up（MSIX $v）" `
             --notes "上游版本: $up (build ${{ needs.check.outputs.build }})`nMSIX 版本: $v`nicons: ${{ steps.pack.outputs.icons }}`nfrom: CyrilPeng/Venera-Next"
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
-          $url = "https://github.com/$repo/releases/download/$tag/Venera.msix"
+          $url = "https://github.com/$repo/releases/download/$tag/Venera.msixbundle"
           Write-Host "DIRECT URL = $url"
           "url=$url" | Out-File -Append $env:GITHUB_OUTPUT
       - name: Upload artifact (fallback only)
         if: steps.rel.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: venera-msix
+          name: venera-msixbundle
           path: dist/*
           if-no-files-found: warn
           retention-days: 7
@@ -372,7 +388,7 @@ jobs:
             "",
             "然后：",
             "  1. 点右上角的【更新】按钮",
-            "  2. 上传刚下载的 Venera.msix",
+            "  2. 上传刚下载的 Venera.msixbundle",
             "  3. 提交认证（约 3 个工作日）",
             "",
             "-- GitHub Actions 自动发送"
