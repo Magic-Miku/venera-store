@@ -48,6 +48,11 @@ jobs:
       - name: Check upstream
         id: c
         run: |
+          # GitHub 默认用 `bash -e`（errexit）跑 run 块：任何一条命令返回非 0 就【静默】退出，
+          # 连 ::error:: 都来不及打印 —— 我们刚踩过这个坑
+          # （仓库里没有 source.png，sha256sum 失败 → 8 秒退出码 1，注解里什么都没有）。
+          # 这里显式关掉 errexit，改由脚本自己判断哪些情况算致命（下面有明确的 ::error:: + exit 1）。
+          set +e
           set -o pipefail
           REPO="CyrilPeng/Venera-Next"
 
@@ -75,8 +80,8 @@ jobs:
             echo "::warning::API 解析未成功（tag='$TAG' url='$ZURL' size='$ZSIZE'），回退到「重定向 + 拼文件名」"
             LOC=$(curl -sSI --max-time 60 --retry 3 \
                    "https://github.com/$REPO/releases/latest" \
-                   | grep -i '^location:' | tail -1 | tr -d '\r' | sed 's/^[Ll]ocation: *//')
-            TAG=$(echo "$LOC" | grep -o 'releases/tag/[^/?#]*' | sed 's|releases/tag/||')
+                   | grep -i '^location:' | tail -1 | tr -d '\r' | sed 's/^[Ll]ocation: *//' || true)
+            TAG=$(echo "$LOC" | grep -o 'releases/tag/[^/?#]*' | sed 's|releases/tag/||' || true)
             if [ -z "$TAG" ]; then
               echo "::error::两种方式都拿不到 tag（上游可能改了发布方式，或网络异常）"
               exit 1
@@ -85,7 +90,7 @@ jobs:
             ZURL="https://github.com/$REPO/releases/download/$TAG/VeneraNext-$V0-windows.zip"
             ZSIZE=$(curl -sSIL --max-time 60 --retry 3 "$ZURL" \
                     | grep -i '^content-length:' | tail -1 | tr -d '\r' \
-                    | sed 's/^[Cc]ontent-[Ll]ength: *//' | tr -d '"')
+                    | sed 's/^[Cc]ontent-[Ll]ength: *//' | tr -d '"' || true)
             ZUPD="unknown"
           fi
 
@@ -106,19 +111,23 @@ jobs:
           fi
 
           echo "=== 第 5 步: 上游 build 号（仅用于展示）==="
+          # release.json 可能不存在（只是显示用），失败不能拖垮整个检查
           B=$(curl -sSL --max-time 30 --retry 2 \
               "https://raw.githubusercontent.com/$REPO/$TAG/release.json" \
-              | grep -o '"build": *[0-9]*' | head -1 | sed 's/.*: *//')
-          [ -z "$B" ] && B="0"
+              | grep -o '"build": *[0-9]*' | head -1 | sed 's/.*: *//' || true)
+          if [ -z "$B" ]; then B="0"; fi
           echo "upstream build = $B"
 
           echo "=== 第 6 步: 指纹（5 段式）==="
           # tag | 资产大小 | 资产更新时间 | 图标源哈希 | 工作流哈希
           # 把「图标源」和「工作流自身」算进来，否则换图标/改脚本后会被判「无更新」而永久跳过。
-          ICON_HASH=$(sha256sum .github/store-icons/source.png 2>/dev/null | cut -c1-16)
-          [ -z "$ICON_HASH" ] && ICON_HASH="noicon"
-          WF_HASH=$(sha256sum .github/workflows/venera.yml 2>/dev/null | cut -c1-16)
-          [ -z "$WF_HASH" ] && WF_HASH="nowf"
+          # 注意：GitHub 的 bash 是 `bash -e`（errexit），我们还开了 pipefail。
+          # source.png 缺失时 sha256sum 返回非 0，会【静默】让整个脚本退出（退出码 1、无任何提示）。
+          # 而「没放图标」完全正常（工作流会自动取上游官方图标），所以必须 `|| true` 兜住。
+          ICON_HASH=$(sha256sum .github/store-icons/source.png 2>/dev/null | cut -c1-16 || true)
+          if [ -z "$ICON_HASH" ]; then ICON_HASH="noicon"; fi
+          WF_HASH=$(sha256sum .github/workflows/venera.yml 2>/dev/null | cut -c1-16 || true)
+          if [ -z "$WF_HASH" ]; then WF_HASH="nowf"; fi
           N="$TAG|$ZSIZE|$ZUPD|$ICON_HASH|$WF_HASH"
           echo "current  = $N"
           echo "recorded = ${O:-（无）}"
