@@ -241,8 +241,10 @@ jobs:
           Write-Host "payload files = $n"
           if ($n -lt 50) { throw "payload 文件过少: $n" }
 
-      - name: Pack
-        id: pack
+      # GitHub 对单个 run 块的表达式有 21000 字符上限，
+      # 所以 Pack 拆成 3 步（各自都远低于上限），共用同一个 runner 上的 C:\S。
+      - name: Pack 1/3 - stage (version + payload + runtime)
+        id: stage
         run: |
           $ErrorActionPreference = "Stop"
           $root = "C:\V\" + (Get-ChildItem "C:\V" -Directory)[0].Name
@@ -261,7 +263,9 @@ jobs:
           }
           $mk = Find-Kit "makeappx.exe"
           if (-not $mk) { throw "未找到 makeappx.exe（Windows Kits 未安装？）" }
+          $mp = Find-Kit "makepri.exe"
           Write-Host "makeappx = $mk"
+          Write-Host "makepri  = $(if ($mp) { $mp } else { '(未找到!)' })"
 
           # ---------- MSIX 版本 ----------
           # 商店两条硬性规则:
@@ -283,6 +287,9 @@ jobs:
             if ($n -gt 65535) { throw "版本段超过 65535: $v" }
           }
           if ([int]$vp[0] -lt 2026) { throw "版本第 1 段小于 2026，会被商店判为降级: $v" }
+          "ver=$v"  | Out-File -Append $env:GITHUB_OUTPUT
+          "mk=$mk"  | Out-File -Append $env:GITHUB_OUTPUT
+          "mp=$mp"  | Out-File -Append $env:GITHUB_OUTPUT
 
           # ---------- 原样复制 payload ----------
           $s = "C:\S"
@@ -363,6 +370,14 @@ jobs:
           $staged = @(Get-ChildItem $s -Recurse -File -Force).Count
           Write-Host "staged = $staged"
           if ($staged -lt 50) { throw "暂存不完整: $staged" }
+
+      - name: Pack 2/3 - icons + manifest
+        id: icons
+        run: |
+          $ErrorActionPreference = "Stop"
+          $s = "C:\S"
+          $v = "${{ steps.stage.outputs.ver }}"
+          Write-Host "MSIX version = $v"
 
           # ================= 图标：从 source.png 现生成 =================
           # 关键：targetsize 资产的前缀必须是清单里引用的名字（Square44x44Logo），
@@ -598,12 +613,25 @@ jobs:
           )
           [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
 
+      - name: Pack 3/3 - pri + package
+        id: pack
+        run: |
+          $ErrorActionPreference = "Stop"
+          $s  = "C:\S"
+          $a  = "$s\Assets"
+          $v  = "${{ steps.stage.outputs.ver }}"
+          $mk = "${{ steps.stage.outputs.mk }}"
+          $mp = "${{ steps.stage.outputs.mp }}"
+          Write-Host "MSIX version = $v"
+          Write-Host "makeappx = $mk"
+          $iconN = @(Get-ChildItem $a -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+          Write-Host "icons = $iconN"
+
           # ================= 生成 resources.pri =================
           # 关键：Square44x44Logo.targetsize-* 是「限定符资源」。
           # 没有 resources.pri，Windows 无法解析 TargetSize/Theme 限定符，
           # 只能退回「缩小图标 + 画底板」的渲染方式 —— 这就是任务栏出现底板的原因。
           $priOk = $false
-          $mp = Find-Kit "makepri.exe"
           if ($mp -and (Test-Path $mp)) {
             Write-Host "makepri = $mp"
             $pricfgLines = @(
