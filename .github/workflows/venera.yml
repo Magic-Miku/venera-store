@@ -518,13 +518,15 @@ jobs:
                 }
                 if ($lx -lt 0) { continue }
                 for ($x = 0; $x -lt $lx; $x++) {
-                  $o = $row + $x * 4; $s = $row + $lx * 4
-                  $buf[$o] = $buf[$s]; $buf[$o+1] = $buf[$s+1]; $buf[$o+2] = $buf[$s+2]; $buf[$o+3] = 255
+                  # 注意：这里绝不能用 $s 当临时变量 —— $s 是分阶段目录 "C:\S"，
+                  # 被覆盖后写 AppxManifest.xml 的路径就会变成一串数字（踩过这个坑）。
+                  $o = $row + $x * 4; $q = $row + $lx * 4
+                  $buf[$o] = $buf[$q]; $buf[$o+1] = $buf[$q+1]; $buf[$o+2] = $buf[$q+2]; $buf[$o+3] = 255
                   $filled++
                 }
                 for ($x = $rx + 1; $x -lt $fw; $x++) {
-                  $o = $row + $x * 4; $s = $row + $rx * 4
-                  $buf[$o] = $buf[$s]; $buf[$o+1] = $buf[$s+1]; $buf[$o+2] = $buf[$s+2]; $buf[$o+3] = 255
+                  $o = $row + $x * 4; $q = $row + $rx * 4
+                  $buf[$o] = $buf[$q]; $buf[$o+1] = $buf[$q+1]; $buf[$o+2] = $buf[$q+2]; $buf[$o+3] = 255
                   $filled++
                 }
               }
@@ -606,7 +608,8 @@ jobs:
 
           # ================= 清单 =================
           $pdn = [char]0xD835 + [char]0xDD78 + 'ik' + [char]0x0E19 + [char]0x795E + [char]0x6559 + [char]0x2728 + [char]0x6559 + [char]0x4E3B
-          $x = @(
+          # 清单数组用 $mf，不要复用 $x —— $x 上面当过循环计数器，复用同一个名字容易踩坑。
+          $mf = @(
             '<?xml version="1.0" encoding="utf-8"?>'
             '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap" xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest">'
             ('  <Identity Name="14714BE0.Venera" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" />')
@@ -645,7 +648,10 @@ jobs:
             '  <mp:PhoneIdentity PhoneProductId="926903e4-7b05-4c92-b01b-6c25d2f4a335" PhonePublisherId="1bf42279-ce31-40ab-8b3e-fcd19d939971" />'
             '</Package>'
           )
-          [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
+          # 防御性重设：图标处理过程里若又不小心覆盖了 $s，这里再确认一次分阶段目录，
+          # 避免清单被写到一串数字命名的目录下（AppxManifest.xml 找不到）。
+          $s = "C:\S"
+          [IO.File]::WriteAllText("$s\AppxManifest.xml", ($mf -join "`n"), (New-Object Text.UTF8Encoding $false))
 
       - name: Pack 3/3 - pri + package
         id: pack
