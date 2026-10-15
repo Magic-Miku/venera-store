@@ -388,7 +388,7 @@ jobs:
           # ---------- 附加许可证与源码说明（GPL-3.0 合规）----------
           # GPL 要求把许可证副本随二进制一起交给用户。放在【包里】而不是商店描述里，
           # 商店列表就能保持低调、不含任何上游信息。
-          # LICENSE 由仓库提供（.github/app-legal/LICENSE）；SOURCE.txt 在这里现生成。
+          # LICENSE 由仓库提供（根目录 或 .github/app-legal/）；SOURCE.txt 在这里现生成。
           Write-Host "=== 附加许可证（GPL-3.0）==="
           # 两个位置都支持：仓库根目录 LICENSE，或 .github/app-legal/LICENSE
           $licSrc = $null
@@ -651,9 +651,9 @@ jobs:
             '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap" xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest">'
             ('  <Identity Name="14714BE0.Venera" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" />')
             '  <Properties>'
-            '    <DisplayName>Venera漫画</DisplayName>'
+            '    <DisplayName>聚合漫画</DisplayName>'
             ('    <PublisherDisplayName>' + $pdn + '</PublisherDisplayName>')
-            '    <Description>Venera漫画 - 本地与在线漫画阅读器，支持 WebDAV 与自定义漫画源</Description>'
+            '    <Description>聚合漫画 - 本地与在线漫画阅读器，支持 WebDAV 与自定义漫画源</Description>'
             '    <Logo>Assets\StoreLogo.png</Logo>'
             '  </Properties>'
             '  <Dependencies>'
@@ -665,7 +665,7 @@ jobs:
             '  </Resources>'
             '  <Applications>'
             '    <Application Id="App" Executable="VeneraNext.exe" EntryPoint="Windows.FullTrustApplication">'
-            ('      <uap:VisualElements DisplayName="Venera漫画" Description="Venera漫画 - 本地与在线漫画阅读器" BackgroundColor="' + $brandHex + '" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">')
+            ('      <uap:VisualElements DisplayName="聚合漫画" Description="聚合漫画 - 本地与在线漫画阅读器" BackgroundColor="' + $brandHex + '" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">')
             '        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square310x310Logo="Assets\Square310x310Logo.png" Square71x71Logo="Assets\Square71x71Logo.png">'
             '          <uap:ShowNameOnTiles>'
             '            <uap:ShowOn Tile="square150x150Logo" />'
@@ -823,6 +823,11 @@ jobs:
           Write-Host ("  resources.pri     ok ({0} KB)" -f $vPriKB)
           Write-Host ("  Assets            {0} 个" -f $vAssets)
           if ($vAssets -lt 50) { throw "解包复核失败：成品包里 Assets 只有 $vAssets 个" }
+          # 顺带确认许可证文件也进了成品
+          if (Test-Path "$vk\LICENSE") { Write-Host "  LICENSE            ok" }
+          else { Write-Host "::warning::成品包里没有 LICENSE" }
+          if (Test-Path "$vk\SOURCE.txt") { Write-Host "  SOURCE.txt         ok" }
+          else { Write-Host "::warning::成品包里没有 SOURCE.txt" }
           Remove-Item $vk -Recurse -Force -ErrorAction SilentlyContinue
           Write-Host "成品复核通过"
 
@@ -863,8 +868,8 @@ jobs:
           $tag  = "latest"
           $v    = "${{ steps.pack.outputs.ver }}"
           $up   = "${{ needs.check.outputs.ver }}"
-          $title = "Venera漫画 $v（最新）"
-          $notes = "版本: $v`n上游版本: $up (build ${{ needs.check.outputs.build }})`n本次触发: ${{ needs.check.outputs.reason }}`nicons: ${{ steps.pack.outputs.icons }}`npri: ${{ steps.pack.outputs.pri }}`nlicense: ${{ steps.stage.outputs.lic }}`nfrom: CyrilPeng/Venera-Next"
+          $title = "聚合漫画 $v（最新）"
+          $notes = "版本: $v`n上游版本: $up (build ${{ needs.check.outputs.build }})`n本次触发: ${{ needs.check.outputs.reason }}`nicons: ${{ steps.pack.outputs.icons }}`npri: ${{ steps.pack.outputs.pri }}`nlicense: ${{ steps.stage.outputs.lic }}"
 
           # 不再「删除再重建」——那样会让下载链接出现约 2 秒的 404 窗口。
           # 改成：不存在才创建；存在则用 --clobber 原地覆盖资源。
@@ -931,14 +936,14 @@ jobs:
             $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             if (-not $url) { $url = "(Release 未生成，请到 Actions 页下载 artifact)`n$runUrl" }
             $L = @(
-              "Venera漫画 新包已构建完成。",
+              "聚合漫画 新包已构建完成。",
               "",
               "MSIX 版本: ${{ steps.pack.outputs.ver }}",
               "上游版本: ${{ needs.check.outputs.tag }} (build ${{ needs.check.outputs.build }})",
               "本次触发: ${{ needs.check.outputs.reason }}",
               "大小: ${{ steps.pack.outputs.mb }} MB",
               "图标: ${{ steps.pack.outputs.icons }} 个    pri: ${{ steps.pack.outputs.pri }}",
-              "许可证: $(if ('${{ steps.stage.outputs.lic }}' -eq 'True') { '已附在包内 (LICENSE + SOURCE.txt)' } else { '缺失（建议上传 .github/app-legal/LICENSE）' })",
+              "许可证: $(if ('${{ steps.stage.outputs.lic }}' -eq 'True') { '已附在包内 (LICENSE + SOURCE.txt)' } else { '缺失（建议上传 LICENSE 到仓库根目录）' })",
               "",
               "===== 第 1 步：下载 =====",
               "",
@@ -948,7 +953,7 @@ jobs:
               "",
               "===== 第 2 步：上传商店 =====",
               "",
-              "打开下面链接（直达 Venera漫画 页面）：",
+              "打开下面链接（直达 聚合漫画 页面）：",
               "https://partner.microsoft.com/zh-cn/dashboard/products/9P8TVBWFVX8Z/overview",
               "",
               "然后：",
@@ -964,7 +969,7 @@ jobs:
             $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
             Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl `
               -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" `
-              -Subject "[Venera] 新版本已就绪，可以发布到商店了" `
+              -Subject "[聚合漫画] 新版本已就绪，可以发布到商店了" `
               -Body $body -Encoding UTF8 -Credential $cred -ErrorAction Stop
             Write-Host "::notice title=Mail-OK::成功邮件已发送"
           } catch {
@@ -989,7 +994,7 @@ jobs:
           try {
             $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             $L = @(
-              "Venera 自动构建失败了，需要你检查一下。",
+              "聚合漫画 自动构建失败了，需要你检查一下。",
               "",
               "check 结果: ${{ needs.check.result }}",
               "build 结果: ${{ needs.build.result }}",
@@ -1010,7 +1015,7 @@ jobs:
             $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
             Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl `
               -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" `
-              -Subject "[Venera] 构建失败，需要检查" `
+              -Subject "[聚合漫画] 构建失败，需要检查" `
               -Body $body -Encoding UTF8 -Credential $cred -ErrorAction Stop
             Write-Host "::notice title=Mail-OK::失败邮件已发送"
           } catch {
