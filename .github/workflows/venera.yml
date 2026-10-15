@@ -256,6 +256,15 @@ jobs:
         id: stage
         run: |
           $ErrorActionPreference = "Stop"
+          # PowerShell 7 会把原生程序写到 stderr 的内容当错误并终止（curl 的进度条就在 stderr）。
+          # 关掉这个行为，否则 curl 一输出进度就会把步骤判失败。
+          $PSNativeCommandUseErrorActionPreference = $false
+          # 让任何未捕获的失败都以 ::error:: 出现在 Actions 的 Annotations 里，便于远程诊断。
+          trap {
+            Write-Host "::error title=Pack-1-3::失败: $($_.Exception.Message)"
+            Write-Host $_.InvocationInfo.PositionMessage
+            exit 1
+          }
           $root = "C:\V\" + (Get-ChildItem "C:\V" -Directory)[0].Name
           Write-Host "payload root = $root"
 
@@ -384,6 +393,12 @@ jobs:
         id: icons
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          trap {
+            Write-Host "::error title=Pack-2-3::失败: $($_.Exception.Message)"
+            Write-Host $_.InvocationInfo.PositionMessage
+            exit 1
+          }
           $s = "C:\S"
           $v = "${{ steps.stage.outputs.ver }}"
           Write-Host "MSIX version = $v"
@@ -395,16 +410,26 @@ jobs:
           New-Item -ItemType Directory -Force -Path $a | Out-Null
           $srcIcon = "$env:GITHUB_WORKSPACE\.github\store-icons\source.png"
           if (-not (Test-Path $srcIcon)) {
-            # 没放自定义图标时，直接取上游官方 app_icon.png（按 release tag 固定版本）。
-            # 这样不放图标也能开箱即用，且永远与官方版本一致；
+            # 没放自定义图标时，自动取上游官方 app_icon.png。
+            # 先按 release tag 取（与版本一致），失败再退回 main 分支，双保险。
             # 想换图标时，往 .github/store-icons/source.png 放一张即可覆盖。
             $upTag = "${{ needs.check.outputs.tag }}"
             $fb    = "$env:RUNNER_TEMP\source.png"
-            $fbUrl = "https://raw.githubusercontent.com/CyrilPeng/Venera-Next/$upTag/assets/app_icon.png"
-            Write-Host "source.png 未提供，改用上游官方图标: $fbUrl"
-            curl.exe -L --retry 5 --retry-delay 3 --retry-all-errors --max-time 300 -o $fb $fbUrl
-            if (-not (Test-Path $fb) -or (Get-Item $fb).Length -lt 5000) {
-              throw "source.png 未提供，且上游官方图标下载失败: $fbUrl"
+            $got   = $false
+            foreach ($ref in @($upTag, "main")) {
+              $u = "https://raw.githubusercontent.com/CyrilPeng/Venera-Next/$ref/assets/app_icon.png"
+              Write-Host "尝试获取上游官方图标: $u"
+              # -s 静默进度条（curl 默认写到 stderr，PowerShell 7 会当错误）；再兜一层 2>$null
+              curl.exe -sSL --retry 3 --retry-delay 2 --retry-all-errors --max-time 120 -o $fb $u 2>$null
+              if ((Test-Path $fb) -and ((Get-Item $fb).Length -gt 5000)) {
+                Write-Host ("  成功，{0} 字节" -f (Get-Item $fb).Length)
+                $got = $true
+                break
+              }
+              Write-Host "  失败，换下一个来源"
+            }
+            if (-not $got) {
+              throw "无法获取上游官方图标（tag=$upTag 与 main 都失败）—— 请把 app_icon.png 放到 .github/store-icons/source.png"
             }
             $srcIcon = $fb
           }
@@ -626,6 +651,12 @@ jobs:
         id: pack
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          trap {
+            Write-Host "::error title=Pack-3-3::失败: $($_.Exception.Message)"
+            Write-Host $_.InvocationInfo.PositionMessage
+            exit 1
+          }
           $s  = "C:\S"
           $a  = "$s\Assets"
           $v  = "${{ steps.stage.outputs.ver }}"
