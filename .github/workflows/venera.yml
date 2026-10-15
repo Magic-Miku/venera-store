@@ -385,6 +385,43 @@ jobs:
           }
           Write-Host ("MSVC 运行库依赖校验通过（引用 {0} 个，全部已在包内）" -f $rtRef.Count)
 
+          # ---------- 附加许可证与源码说明（GPL-3.0 合规）----------
+          # GPL 要求把许可证副本随二进制一起交给用户。放在【包里】而不是商店描述里，
+          # 商店列表就能保持低调、不含任何上游信息。
+          # LICENSE 由仓库提供（.github/app-legal/LICENSE）；SOURCE.txt 在这里现生成。
+          Write-Host "=== 附加许可证（GPL-3.0）==="
+          # 两个位置都支持：仓库根目录 LICENSE，或 .github/app-legal/LICENSE
+          $licSrc = $null
+          foreach ($p in @("$env:GITHUB_WORKSPACE\LICENSE", "$env:GITHUB_WORKSPACE\.github\app-legal\LICENSE")) {
+            if (Test-Path $p) { $licSrc = $p; break }
+          }
+          $licOk = $false
+          if ($licSrc) {
+            Copy-Item $licSrc (Join-Path $s "LICENSE") -Force
+            $licOk = $true
+            Write-Host ("  已附加 LICENSE（{0} 字节，来自 {1}）" -f (Get-Item $licSrc).Length, $licSrc)
+          } else {
+            Write-Host "::warning::未找到 LICENSE —— 建议上传一份 GPL-3.0 全文到仓库根目录"
+          }
+          $srcNote = @(
+            "本应用由 Venera-Next 重新打包为 Windows 应用。"
+            "遵循 GNU General Public License v3.0 (GPL-3.0)。"
+            ""
+            "对应源代码:"
+            "https://github.com/CyrilPeng/Venera-Next"
+            ""
+            "本打包版所做的改动:"
+            "- 添加 MSIX 应用清单 (AppxManifest.xml) 与资源索引 (resources.pri)"
+            "- 附加 Microsoft Visual C++ 运行库 (app-local 部署)"
+            "- 未修改上游任何程序文件"
+            ""
+            "许可证全文见同目录下的 LICENSE 文件。"
+          )
+          # 带 BOM 写：里面是中文，不带 BOM 时某些编辑器会用 GBK 打开变成乱码
+          [IO.File]::WriteAllText((Join-Path $s "SOURCE.txt"), ($srcNote -join "`n"), (New-Object Text.UTF8Encoding $true))
+          Write-Host "  已生成 SOURCE.txt"
+          "lic=$licOk" | Out-File -Append $env:GITHUB_OUTPUT
+
           $staged = @(Get-ChildItem $s -Recurse -File -Force).Count
           Write-Host "staged = $staged"
           if ($staged -lt 50) { throw "暂存不完整: $staged" }
@@ -616,7 +653,7 @@ jobs:
             '  <Properties>'
             '    <DisplayName>Venera漫画</DisplayName>'
             ('    <PublisherDisplayName>' + $pdn + '</PublisherDisplayName>')
-            '    <Description>Venera漫画 - 跨平台漫画阅读器，支持本地漫画、WebDAV 与网络漫画源</Description>'
+            '    <Description>Venera漫画 - 本地与在线漫画阅读器，支持 WebDAV 与自定义漫画源</Description>'
             '    <Logo>Assets\StoreLogo.png</Logo>'
             '  </Properties>'
             '  <Dependencies>'
@@ -628,7 +665,7 @@ jobs:
             '  </Resources>'
             '  <Applications>'
             '    <Application Id="App" Executable="VeneraNext.exe" EntryPoint="Windows.FullTrustApplication">'
-            ('      <uap:VisualElements DisplayName="Venera漫画" Description="Venera漫画 - 跨平台漫画阅读器" BackgroundColor="' + $brandHex + '" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">')
+            ('      <uap:VisualElements DisplayName="Venera漫画" Description="Venera漫画 - 本地与在线漫画阅读器" BackgroundColor="' + $brandHex + '" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">')
             '        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square310x310Logo="Assets\Square310x310Logo.png" Square71x71Logo="Assets\Square71x71Logo.png">'
             '          <uap:ShowNameOnTiles>'
             '            <uap:ShowOn Tile="square150x150Logo" />'
@@ -827,7 +864,7 @@ jobs:
           $v    = "${{ steps.pack.outputs.ver }}"
           $up   = "${{ needs.check.outputs.ver }}"
           $title = "Venera漫画 $v（最新）"
-          $notes = "版本: $v`n上游版本: $up (build ${{ needs.check.outputs.build }})`n本次触发: ${{ needs.check.outputs.reason }}`nicons: ${{ steps.pack.outputs.icons }}`npri: ${{ steps.pack.outputs.pri }}`nfrom: CyrilPeng/Venera-Next"
+          $notes = "版本: $v`n上游版本: $up (build ${{ needs.check.outputs.build }})`n本次触发: ${{ needs.check.outputs.reason }}`nicons: ${{ steps.pack.outputs.icons }}`npri: ${{ steps.pack.outputs.pri }}`nlicense: ${{ steps.stage.outputs.lic }}`nfrom: CyrilPeng/Venera-Next"
 
           # 不再「删除再重建」——那样会让下载链接出现约 2 秒的 404 窗口。
           # 改成：不存在才创建；存在则用 --clobber 原地覆盖资源。
@@ -901,6 +938,7 @@ jobs:
               "本次触发: ${{ needs.check.outputs.reason }}",
               "大小: ${{ steps.pack.outputs.mb }} MB",
               "图标: ${{ steps.pack.outputs.icons }} 个    pri: ${{ steps.pack.outputs.pri }}",
+              "许可证: $(if ('${{ steps.stage.outputs.lic }}' -eq 'True') { '已附在包内 (LICENSE + SOURCE.txt)' } else { '缺失（建议上传 .github/app-legal/LICENSE）' })",
               "",
               "===== 第 1 步：下载 =====",
               "",
