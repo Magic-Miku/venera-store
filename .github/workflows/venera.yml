@@ -194,7 +194,7 @@ jobs:
           N=0
           while IFS='|' read -r ID NAME; do
             [ -z "$ID" ] && continue
-            if [ [ "$NAME" = "$KEEP" ]; then continue; fi
+            if [ "$NAME" = "$KEEP" ]; then continue; fi
             gh api -X DELETE "repos/$REPO/actions/artifacts/$ID" >/dev/null 2>&1 || \
               echo "::warning::删除 artifact $ID 失败"
             N=$((N+1))
@@ -326,7 +326,7 @@ jobs:
           # 这三个是【实测】出来的：解析整个 payload 的 PE 导入表（82 个被导入 DLL），
           # VeneraNext.exe 确实导入 MSVCP140 / VCRUNTIME140 / VCRUNTIME140_1，
           # 而官方 zip 里这三个一个都没有 —— 不补进去，用户端一启动就崩。
-          # concrt140 则没有任何文件引用它（实测），所以不塞，省 200KB 无用体积。
+          # concrt140 则没有任何文件导入它（实测），所以不塞，省 200KB 无用体积。
           $vcCritical = @("msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll")
           $vcOptional = @()
           $vcMissing  = @()
@@ -388,7 +388,7 @@ jobs:
           # ---------- 附加许可证与源码说明（GPL-3.0 合规）----------
           # GPL 要求把许可证副本随二进制一起交给用户。放在【包里】而不是商店描述里，
           # 商店列表就能保持低调、不含任何上游信息。
-          # LICENSE 由仓库提供（根目录 或 .github/app-legal/）；SOURCE.txt 在这里现生成。
+          # LICENSE 由仓库提供（.github/app-legal/LICENSE）；SOURCE.txt 在这里现生成。
           Write-Host "=== 附加许可证（GPL-3.0）==="
           # 两个位置都支持：仓库根目录 LICENSE，或 .github/app-legal/LICENSE
           $licSrc = $null
@@ -611,7 +611,7 @@ jobs:
             New-Icon (Join-Path $a "StoreLogo.png")          50  50  $false
             New-Icon (Join-Path $a "Square44x44Logo.png")    44  44  $false
             New-Icon (Join-Path $a "Square71x71Logo.png")    71  71  $false
-            New-Icon (Join-Path $a "SunSquare150x150Logo.png") 150 150  $false
+            New-Icon (Join-Path $a "Square150x150Logo.png") 150 150  $false
             New-Icon (Join-Path $a "Square310x310Logo.png") 310 310  $false
             New-Icon (Join-Path $a "Wide310x150Logo.png")   310 150  $true
             New-Icon (Join-Path $a "SplashScreen.png")      620 300  $true
@@ -732,7 +732,7 @@ jobs:
               '      <qualifier name="Scale" value="100"/>',
               '      <qualifier name="HomeRegion" value="001"/>',
               '      <qualifier name="TargetSize" value="256"/>',
-              '      <qualifier name="LayoutDirection" value="LR"/>',
+              '      <qualifier name="LayoutDirection" value="LTR"/>',
               '      <qualifier name="Theme" value="dark"/>',
               '      <qualifier name="AlternateForm" value=""/>',
               '      <qualifier name="DXFeatureLevel" value="DX9"/>',
@@ -823,18 +823,13 @@ jobs:
           Write-Host ("  resources.pri     ok ({0} KB)" -f $vPriKB)
           Write-Host ("  Assets            {0} 个" -f $vAssets)
           if ($vAssets -lt 50) { throw "解包复核失败：成品包里 Assets 只有 $vAssets 个" }
-          # 顺带确认许可证文件也进了成品
-          if (Test-Path "$vk\LICENSE") { Write-Host "  LICENSE            ok" }
-          else { Write-Host "::warning::成品包里没有 LICENSE" }
-          if (Test-Path "$vk\SOURCE.txt") { Write-Host "  SOURCE.txt         ok" }
-          else { Write-Host "::warning::成品包里没有 SOURCE.txt" }
           Remove-Item $vk -Recurse -Force -ErrorAction SilentlyContinue
           Write-Host "成品复核通过"
 
           Write-Host "=== makeappx bundle (.msixbundle) ==="
           # 商店要求: 此应用上次提交用的是 msixbundle，后续必须继续用 bundle
           $bd = "C:\B"
-          if (Test-Path $bd) { Remove-Item $bd -Recess -Force -ErrorAction SilentlyContinue }
+          if (Test-Path $bd) { Remove-Item $bd -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path $bd | Out-Null
           Copy-Item "$out\v.appx" (Join-Path $bd "Venera.msix") -Force
           & $mk bundle /d $bd /p "$out\v.msixbundle" /o 2>&1 | Tee-Object "$out\bundle.log"
@@ -869,7 +864,7 @@ jobs:
           $v    = "${{ steps.pack.outputs.ver }}"
           $up   = "${{ needs.check.outputs.ver }}"
           $title = "Venera漫画 $v（最新）"
-          $notes = "版本: $v`n上游版本: $up (build ${{ needs.check.outputs.build }})`n本次触发: ${{ needs.check.outputs.reason }}`nicons: ${{ steps.pack.outputs.icons }}`npri: ${{ steps.pack.outputs.pri }}`nlicense: ${{ steps.stage.outputs.lic }}"
+          $notes = "版本: $v`n上游版本: $up (build ${{ needs.check.outputs.build }})`n本次触发: ${{ needs.check.outputs.reason }}`nicons: ${{ steps.pack.outputs.icons }}`npri: ${{ steps.pack.outputs.pri }}`nlicense: ${{ steps.stage.outputs.lic }}`nfrom: CyrilPeng/Venera-Next"
 
           # 不再「删除再重建」——那样会让下载链接出现约 2 秒的 404 窗口。
           # 改成：不存在才创建；存在则用 --clobber 原地覆盖资源。
@@ -943,7 +938,7 @@ jobs:
               "本次触发: ${{ needs.check.outputs.reason }}",
               "大小: ${{ steps.pack.outputs.mb }} MB",
               "图标: ${{ steps.pack.outputs.icons }} 个    pri: ${{ steps.pack.outputs.pri }}",
-              "许可证: $(if ('${{ steps.stage.outputs.lic }}' -eq 'True') { '已附在包内 (LICENSE + SOURCE.txt)' } else { '缺失（建议上传 LICENSE 到仓库根目录）' })",
+              "许可证: $(if ('${{ steps.stage.outputs.lic }}' -eq 'True') { '已附在包内 (LICENSE + SOURCE.txt)' } else { '缺失（建议上传 .github/app-legal/LICENSE）' })",
               "",
               "===== 第 1 步：下载 =====",
               "",
