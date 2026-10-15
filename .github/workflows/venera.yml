@@ -1,4 +1,7 @@
 name: Venera Auto Build
+
+# 自动把 CyrilPeng/Venera-Next 的官方 Windows 版打成 MSIX Bundle 并发布到 GitHub Release，
+# 供上传微软商店。每天检查一次上游，只有真有变化才构建。
 on:
   schedule:
     - cron: '37 3 * * *'
@@ -8,89 +11,152 @@ on:
         description: force build
         type: boolean
         default: false
+
 permissions:
   contents: write
   actions: write
+
+# 同一时刻只允许一次运行，避免两次运行互相覆盖 latest 发布 / git push 冲突
+concurrency:
+  group: venera-build
+  cancel-in-progress: false
+
 jobs:
+  # ============================================================
+  check: 判断上游是否有变化（不打完整包，几十秒结束）
+  # ============================================================
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     outputs:
       changed: ${{ steps.c.outputs.changed }}
-      tag: ${{ steps.c.outputs.tag }}
-      ver: ${{ steps.c.outputs.ver }}
-      mm: ${{ steps.c.outputs.mm }}
-      zipurl: ${{ steps.c.outputs.zipurl }}
+      tag:     ${{ steps.c.outputs.tag }}
+      ver:     ${{ steps.c.outputs.ver }}
+      mm:      ${{ steps.c.outputs.mm }}
+      zipurl:  ${{ steps.c.outputs.zipurl }}
       zipsize: ${{ steps.c.outputs.zipsize }}
-      build: ${{ steps.c.outputs.build }}
+      zupd:    ${{ steps.c.outputs.zupd }}
+      build:   ${{ steps.c.outputs.build }}
+      iconhash: ${{ steps.c.outputs.iconhash }}
+      wfhash:   ${{ steps.c.outputs.wfhash }}
+      reason:   ${{ steps.c.outputs.reason }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 1
-      - id: c
+
+      - name: Check upstream
+        id: c
         run: |
           set -o pipefail
           REPO="CyrilPeng/Venera-Next"
 
           echo "=== 第 1 步: 读本地记录 ==="
           O=""
-          [ -f .venera-ver ] && O=$(cat .venera-ver | tr -d '\r\n')
+          if [ -f .venera-ver ]; then O=$(cat .venera-ver | tr -d '\r\n"' | tr -d ' '); fi
           echo "recorded = ${O:-（无）}"
 
-          echo "=== 第 2 步: 拿最新稳定 tag（重定向，0 API 配额）==="
-          # /releases/latest 会 302 到 /releases/tag/<tag>
-          # GitHub 保证只指向稳定版（自动跳过 prerelease / draft）
-          LOC=$(curl -sSI --max-time 60 --retry 3 \
-                 "https://github.com/$REPO/releases/latest" \
-                 | grep -i '^location:' | tail -1 | tr -d '\r' | sed 's/^[Ll]ocation: *//')
-          echo "location = $LOC"
-          TAG=$(echo "$LOC" | grep -o 'releases/tag/[^/?#]*' | sed 's|releases/tag/||')
-          if [ -z "$TAG" ]; then
-            echo "::error::无法从重定向提取 tag，本次跳过"
+          echo "=== 第 2 步: 用 API 解析最新稳定版（带 token，配额 5000/小时）==="
+          # 为什么不拼文件名：上游一旦改资产命名，拼字符串就失效、流水线停摆。
+          # 这里直接列 assets 按模式匹配，并顺带拿到 size 与 updated_at ——
+          # updated_at 能发现「同名同大小重传」，HEAD 拿不到这个信息。
+          REL=$(curl -sS --max-time 60 --retry 3 \
+                 -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                 -H "Accept: application/vnd.github+json" \
+                 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+
+          JQ_F='[.assets[] | select(.name|test("windows.*\\.zip$")) | select(.name|test("installer")|not)] | .[0]'
+          TAG=$(echo "$REL"   | jq -r '.tag_name // empty' 2>/dev/null || true)
+          ZURL=$(echo "$REL"  | jq -r "$JQ_F | .browser_download_url // empty" 2>/dev/null || true)
+          ZSIZE=$(echo "$REL" | jq -r "$JQ_F | .size // empty" 2>/dev/null || true)
+          ZUPD=$(echo "$REL"  | jq -r "$JQ_F | .updated_at // empty" 2>/dev/null || true)
+
+          if [ -z "$TAG" ] || [ -z "$ZURL" ] || [ -z "$ZSIZE" ]; then
+            echo "::warning::API 解析未成功（tag='$TAG' url='$ZURL' size='$ZSIZE'），回退到「重定向 + 拼文件名」"
+            LOC=$(curl -sSI --max-time 60 --retry 3 \
+                   "https://github.com/$REPO/releases/latest" \
+                   | grep -i '^location:' | tail -1 | tr -d '\r' | sed 's/^[Ll]ocation: *//')
+            TAG=$(echo "$LOC" | grep -o 'releases/tag/[^/?#]*' | sed 's|releases/tag/||')
+            if [ -z "$TAG" ]; then
+              echo "::error::两种方式都拿不到 tag（上游可能改了发布方式，或网络异常）"
+              exit 1
+            fi
+            V0="${TAG#v}"
+            ZURL="https://github.com/$REPO/releases/download/$TAG/VeneraNext-$V0-windows.zip"
+            ZSIZE=$(curl -sSIL --max-time 60 --retry 3 "$ZURL" \
+                    | grep -i '^content-length:' | tail -1 | tr -d '\r' \
+                    | sed 's/^[Cc]ontent-[Ll]ength: *//' | tr -d '"')
+            ZUPD="unknown"
+          fi
+
+          if [ -z "$TAG" ] || [ -z "$ZURL" ]; then
+            echo "::error::无法确定上游版本或资产"
             exit 1
           fi
           VER="${TAG#v}"
-          echo "latest tag = $TAG   version = $VER"
-          # 商店硬性规则: MSIX 版本第 4 段(Revision) 必须为 0
-          # 所以取上游 major.minor 作为前两段, 第 3 段用 run_number 保证递增
           MM=$(echo "$VER" | cut -d. -f1,2)
-          echo "major.minor = $MM"
-
-          echo "=== 第 3 步: 拼 zip URL（命名规律已验证 23/23 个 release）==="
-          ZIPNAME="VeneraNext-$VER-windows.zip"
-          ZURL="https://github.com/$REPO/releases/download/$TAG/$ZIPNAME"
-          echo "zip = $ZURL"
-
-          echo "=== 第 4 步: HEAD 取大小（0 API 配额）==="
-          ZSIZE=$(curl -sSIL --max-time 60 --retry 3 "$ZURL" \
-                  | grep -i '^content-length:' | tail -1 | tr -d '\r' \
-                  | sed 's/^[Cc]ontent-[Ll]ength: *//')
-          echo "size = ${ZSIZE:-（未取到）} bytes"
+          echo "tag              = $TAG"
+          echo "version          = $VER   major.minor = $MM"
+          echo "zip              = $ZURL"
+          echo "size             = ${ZSIZE:-（未取到）} bytes"
+          echo "asset updated_at = ${ZUPD:-（未取到）}"
           if [ -z "$ZSIZE" ] || [ "$ZSIZE" -lt 10000000 ]; then
-            echo "::error::zip 大小异常（$ZSIZE），本次跳过"
+            echo "::error::zip 大小异常（$ZSIZE），上游可能改了资产命名"
             exit 1
           fi
 
-          echo "=== 第 5 步: build 号（raw 不占配额，仅展示）==="
+          echo "=== 第 5 步: 上游 build 号（仅用于展示）==="
           B=$(curl -sSL --max-time 30 --retry 2 \
               "https://raw.githubusercontent.com/$REPO/$TAG/release.json" \
               | grep -o '"build": *[0-9]*' | head -1 | sed 's/.*: *//')
           [ -z "$B" ] && B="0"
           echo "upstream build = $B"
 
-          echo "=== 第 6 步: 比对 ==="
-          echo "current  = $TAG"
+          echo "=== 第 6 步: 指纹（5 段式）==="
+          # tag | 资产大小 | 资产更新时间 | 图标源哈希 | 工作流哈希
+          # 把「图标源」和「工作流自身」算进来，否则换图标/改脚本后会被判「无更新」而永久跳过。
+          ICON_HASH=$(sha256sum .github/store-icons/source.png 2>/dev/null | cut -c1-16)
+          [ -z "$ICON_HASH" ] && ICON_HASH="noicon"
+          WF_HASH=$(sha256sum .github/workflows/venera.yml 2>/dev/null | cut -c1-16)
+          [ -z "$WF_HASH" ] && WF_HASH="nowf"
+          N="$TAG|$ZSIZE|$ZUPD|$ICON_HASH|$WF_HASH"
+          echo "current  = $N"
           echo "recorded = ${O:-（无）}"
-          if [ "${{ github.event.inputs.force }}" = "true" ] || [ "$TAG" != "$O" ]; then
+
+          echo "=== 第 7 步: 逐段比对，说明这次是什么变了 ==="
+          # 邮件里会带上这个原因，方便一眼判断「该不该发这一版」
+          REASON="首次构建（本地无记录）"
+          if [ -n "$O" ]; then
+            IFS='|' read -r oTag oSize oUpd oIcon oWf <<< "$O"
+            R=""
+            if [ "$TAG"       != "$oTag"  ]; then R="$R 上游版本"; fi
+            if [ "$ZSIZE"     != "$oSize" ]; then R="$R 上游文件"; fi
+            if [ "$ZUPD"      != "$oUpd"  ]; then R="$R 上游重传"; fi
+            if [ "$ICON_HASH" != "$oIcon" ]; then R="$R 图标"; fi
+            if [ "$WF_HASH"   != "$oWf"   ]; then R="$R 工作流"; fi
+            if [ -n "$R" ]; then REASON="变化:$R"; else REASON="无实际变化"; fi
+          fi
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then REASON="$REASON（手动 force）"; fi
+          echo "reason = $REASON"
+
+          if [ "${{ github.event.inputs.force }}" = "true" ] || [ "$N" != "$O" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
           fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "ver=$VER" >> $GITHUB_OUTPUT
-          echo "mm=$MM" >> $GITHUB_OUTPUT
-          echo "zipurl=$ZURL" >> $GITHUB_OUTPUT
-          echo "zipsize=$ZSIZE" >> $GITHUB_OUTPUT
-          echo "build=$B" >> $GITHUB_OUTPUT
+          {
+            echo "tag=$TAG"
+            echo "ver=$VER"
+            echo "mm=$MM"
+            echo "zipurl=$ZURL"
+            echo "zipsize=$ZSIZE"
+            echo "zupd=$ZUPD"
+            echo "build=$B"
+            echo "iconhash=$ICON_HASH"
+            echo "wfhash=$WF_HASH"
+            echo "reason=$REASON"
+          } >> $GITHUB_OUTPUT
+
       - name: Heartbeat
         if: always()
         continue-on-error: true
@@ -102,8 +168,9 @@ jobs:
           git add .venera-heartbeat
           git diff --cached --quiet && echo "no change" && exit 0
           git commit -m "chore: heartbeat [skip ci]"
-          git pull --rebase --autostash origin main || echo "rebase failed"
-          git push || echo "push failed"
+          git pull --rebase --autostash origin main || echo "::warning::rebase 失败（心跳未提交）"
+          git push || echo "::warning::push 失败 —— 若连续 60 天无法提交，GitHub 会自动禁用本工作流"
+
       - name: Prune old artifacts
         if: always()
         continue-on-error: true
@@ -111,12 +178,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[] | "\(.id)"' > /tmp/a.txt || true
-          while read -r ID; do
+          # 保留兜底 artifact，否则发布失败时就没有可下载的包了
+          KEEP="venera-msixbundle"
+          gh api "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | "\(.id)|\(.name)"' > /tmp/arts.txt || true
+          N=0
+          while IFS='|' read -r ID NAME; do
             [ -z "$ID" ] && continue
-            gh api -X DELETE "repos/$REPO/actions/artifacts/$ID" || true
-          done < /tmp/a.txt
-          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '"剩余 \(.total_count) 个"'
+            if [ "$NAME" = "$KEEP" ]; then continue; fi
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$ID" >/dev/null 2>&1 || \
+              echo "::warning::删除 artifact $ID 失败"
+            N=$((N+1))
+          done < /tmp/arts.txt
+          echo "已清理 $N 个旧 artifact（保留 $KEEP）"
+
+  # ============================================================
+  build: 只有指纹变化时才跑
+  # ============================================================
   build:
     needs: [check]
     if: needs.check.outputs.changed == 'true'
@@ -126,39 +204,43 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 1
+
       - name: Download upstream windows zip
         run: |
-          $url = "${{ needs.check.outputs.zipurl }}"
+          $url  = "${{ needs.check.outputs.zipurl }}"
           $want = [int64]"${{ needs.check.outputs.zipsize }}"
           $f = "$env:RUNNER_TEMP\v.zip"
           Remove-Item $f -Force -ErrorAction SilentlyContinue
           Write-Host "url = $url"
           curl.exe -L --retry 5 --retry-delay 5 --retry-all-errors --max-time 900 -o $f $url
-          if (-not (Test-Path $f)) { throw "download failed" }
+          if (-not (Test-Path $f)) { throw "下载失败" }
           $sz = (Get-Item $f).Length
           Write-Host "downloaded = $sz bytes (upstream $want)"
-          if ($sz -lt 10MB) { throw "too small: $sz" }
-          if ($want -gt 0 -and $sz -ne $want) { throw "size mismatch: $sz vs $want" }
+          if ($sz -lt 10MB) { throw "下载文件过小: $sz" }
+          if ($want -gt 0 -and $sz -ne $want) { throw "大小不符: $sz vs $want（下载可能被截断）" }
           Write-Host "download OK"
+
       - name: Extract payload
         run: |
+          $ErrorActionPreference = "Stop"
           $f = "$env:RUNNER_TEMP\v.zip"
           $tmp = "C:\V"
           if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path $tmp | Out-Null
           Expand-Archive -Path $f -DestinationPath $tmp -Force
           $inner = @(Get-ChildItem $tmp -Directory)
-          if ($inner.Count -ne 1) { throw "unexpected zip layout: $($inner.Count) dirs" }
+          if ($inner.Count -ne 1) { throw "zip 结构异常: 期望 1 个顶层目录，实际 $($inner.Count)" }
           $root = $inner[0].FullName
           Write-Host "payload root = $root"
           $exe = Join-Path $root "VeneraNext.exe"
-          if (-not (Test-Path $exe)) { throw "VeneraNext.exe not found" }
+          if (-not (Test-Path $exe)) { throw "未找到 VeneraNext.exe" }
           $n = @(Get-ChildItem $root -Recurse -File -Force).Count
           Write-Host "payload files = $n"
-          if ($n -lt 50) { throw "too few payload files: $n" }
+          if ($n -lt 50) { throw "payload 文件过少: $n" }
+
       - name: Pack
         id: pack
         run: |
@@ -166,47 +248,66 @@ jobs:
           $root = "C:\V\" + (Get-ChildItem "C:\V" -Directory)[0].Name
           Write-Host "payload root = $root"
 
-          Write-Host "=== 定位 makeappx.exe ==="
-          $mk = $null
-          $cands = @(Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
+          # ---------- 定位 makeappx / makepri ----------
+          function Find-Kit([string]$exe) {
+            $p = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\$exe"
+            if (Test-Path $p) { return $p }
+            foreach ($base in @("C:\Program Files (x86)\Windows Kits\10\bin", "C:\Program Files\Windows Kits\10\bin")) {
+              $c = @(Get-ChildItem $base -Filter $exe -Recurse -ErrorAction SilentlyContinue |
                      Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending)
-          if ($cands.Count -gt 0) { $mk = $cands[0].FullName }
-          if (-not $mk) {
-            $cands2 = @(Get-ChildItem "C:\Program Files\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
-                        Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending)
-            if ($cands2.Count -gt 0) { $mk = $cands2[0].FullName }
+              if ($c.Count -gt 0) { return $c[0].FullName }
+            }
+            return $null
           }
-          if (-not $mk) { throw "makeappx not found in Windows Kits" }
+          $mk = Find-Kit "makeappx.exe"
+          if (-not $mk) { throw "未找到 makeappx.exe（Windows Kits 未安装？）" }
           Write-Host "makeappx = $mk"
 
-          # MSIX 版本: <上游 major.minor>.<run_number>.0
-          #   商店硬性规则: 第 4 段(Revision) 必须为 0, 否则拒收
-          $up = "${{ needs.check.outputs.ver }}"
-          $mm = "${{ needs.check.outputs.mm }}"
-          $v = "$mm.$env:GITHUB_RUN_NUMBER.0"
-          Write-Host "MSIX version = $v   (upstream $up build ${{ needs.check.outputs.build }})"
-          if ($v.Split('.').Count -ne 4) { throw "bad version format: $v" }
-          if ($v.Split('.')[3] -ne "0") { throw "revision must be 0: $v" }
+          # ---------- MSIX 版本 ----------
+          # 商店两条硬性规则:
+          #   (1) 新提交的版本必须【高于】商店上已发布的版本，否则拒收(降级)。
+          #   (2) 第 4 段(Revision) 必须为 0。
+          # 商店上已发布的是 2026.1014.1744.0（日期时间式）。
+          # 因此绝不能用 1.18.x.0 这种形式 —— 第 1 段 1 < 2026，会被判为降级。
+          # 这里沿用同样的日期时间风格 yyyy.MMdd.HHmm.0 (UTC)，天然单调递增。
+          $now = (Get-Date).ToUniversalTime()
+          $v = "{0}.{1}.{2}.0" -f [int]$now.ToString("yyyy"), [int]$now.ToString("MMdd"), [int]$now.ToString("HHmm")
+          Write-Host "MSIX version = $v   (upstream ${{ needs.check.outputs.ver }} build ${{ needs.check.outputs.build }})"
+          Write-Host "       已发布版本为 2026.1014.1744.0，本版本必须更大"
+          $vp = $v.Split('.')
+          if ($vp.Count -ne 4) { throw "版本格式错误: $v" }
+          if ($vp[3] -ne "0") { throw "第 4 段必须为 0: $v" }
+          foreach ($seg in $vp) {
+            $n = 0
+            if (-not [int64]::TryParse($seg, [ref]$n)) { throw "版本段不是数字: $v" }
+            if ($n -gt 65535) { throw "版本段超过 65535: $v" }
+          }
+          if ([int]$vp[0] -lt 2026) { throw "版本第 1 段小于 2026，会被商店判为降级: $v" }
 
+          # ---------- 原样复制 payload ----------
           $s = "C:\S"
           if (Test-Path $s) { Remove-Item $s -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path $s | Out-Null
-          # 原样复制 payload（不改动任何原版文件）
           Get-ChildItem $root -Force | ForEach-Object { Copy-Item $_.FullName $s -Recurse -Force }
 
-          # VC++ 运行库 app-local 部署
-          # 包内不自带 msvcp140/vcruntime140 等 DLL，商店 MSIX 沙箱里也没有系统级 redist。
+          # ---------- VC++ 运行库 app-local 部署 ----------
+          # 上游 zip 不自带 msvcp140/vcruntime140 等 DLL，商店 MSIX 沙箱里也没有系统级 redist。
           # 框架依赖 Microsoft.VCLibs.140.00.UWPDesktop 商店不认（报 Neutral/Universal 不可用），
-          # 因此改为把 runner 自带的 VC++ redist DLL 拷到 exe 同目录（微软允许 app-local，只是不推荐）。
+          # 因此把 runner 自带的 VC++ redist DLL 拷到 exe 同目录（微软允许 app-local）。
           Write-Host "=== 复制 VC++ 运行库 DLL (app-local) ==="
-          $vcNames = @("msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll","concrt140.dll")
-          $vcSrcs = @(
-            "C:\Windows\System32",
-            "C:\Windows\SysWOW64"
-          )
-          foreach ($d in $vcNames) {
+          # 实测：官方 zip 里【完全没有】msvcp140/vcruntime140 等 DLL（只有业务 DLL），
+          # 全新系统/沙箱里不保证装了 redist，所以必须打进包。
+          # 缺了关键 DLL = 用户装好后一启动就崩，因此这里【失败退出】而不是像以前那样只警告。
+          # 这三个是【实测】出来的：解析整个 payload 的 PE 导入表（82 个被导入 DLL），
+          # VeneraNext.exe 确实导入 MSVCP140 / VCRUNTIME140 / VCRUNTIME140_1，
+          # 而官方 zip 里这三个一个都没有 —— 不补进去，用户端一启动就崩。
+          # concrt140 则没有任何文件导入它（实测），所以不塞，省 200KB 无用体积。
+          $vcCritical = @("msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll")
+          $vcOptional = @()
+          $vcMissing  = @()
+          foreach ($d in ($vcCritical + $vcOptional)) {
             $done = $false
-            foreach ($dir in $vcSrcs) {
+            foreach ($dir in @("C:\Windows\System32", "C:\Windows\SysWOW64")) {
               $src = Join-Path $dir $d
               if (Test-Path $src) {
                 Copy-Item $src (Join-Path $s $d) -Force
@@ -215,39 +316,246 @@ jobs:
                 break
               }
             }
-            if (-not $done) { Write-Host ("  WARN: {0} not found on runner" -f $d) }
+            if (-not $done) {
+              if ($vcCritical -contains $d) {
+                $vcMissing += $d
+                Write-Host ("  MISSING(critical) {0}" -f $d)
+              } else {
+                Write-Host ("::warning::可选 DLL {0} 未找到，跳过" -f $d)
+              }
+            }
           }
+          if ($vcMissing.Count -gt 0) {
+            throw ("runner 上缺少关键 VC++ 运行库: " + ($vcMissing -join ", ") +
+                   " —— 打进包会缺依赖导致用户端崩溃，因此中止构建")
+          }
+
+          # 泛化校验：扫出 staging 里所有被引用的 MSVC 运行库名，逐个确认已打进包。
+          # 这样上游将来新增 msvcp140_2 / vcruntime140_2 之类也能自动发现，
+          # 而不是等用户端崩溃才知道。（只匹配发行版名字，debug 版带 d 后缀不会误报）
+          Write-Host "=== 校验 MSVC 运行库依赖 ==="
+          $rtRef = @{}
+          Get-ChildItem $s -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '^\.(exe|dll)$' } |
+            ForEach-Object {
+              $f = $_
+              $ascii = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($f.FullName)).ToUpperInvariant()
+              foreach ($m in [regex]::Matches($ascii, '(MSVCP[0-9]+(?:_[0-9]+)?|VCRUNTIME[0-9]+(?:_[0-9]+)?|CONCRT[0-9]+|VCCORLIB[0-9]+)\.DLL')) {
+                $nm = $m.Value.ToLower()
+                if (-not $rtRef.ContainsKey($nm)) { $rtRef[$nm] = New-Object System.Collections.ArrayList }
+                if (-not $rtRef[$nm].Contains($f.Name)) { [void]$rtRef[$nm].Add($f.Name) }
+              }
+            }
+          $rtMissing = @()
+          foreach ($nm in ($rtRef.Keys | Sort-Object)) {
+            if (Test-Path (Join-Path $s $nm)) {
+              Write-Host ("  ok       {0}" -f $nm)
+            } else {
+              Write-Host ("::error::运行库 {0} 被引用但未打进包（引用者: {1}）" -f $nm, ($rtRef[$nm] -join ", "))
+              $rtMissing += $nm
+            }
+          }
+          if ($rtMissing.Count -gt 0) {
+            throw ("以下 MSVC 运行库被引用但未打进包: " + ($rtMissing -join ", ") + " —— 用户端会加载失败")
+          }
+          Write-Host ("MSVC 运行库依赖校验通过（引用 {0} 个，全部已在包内）" -f $rtRef.Count)
 
           $staged = @(Get-ChildItem $s -Recurse -File -Force).Count
           Write-Host "staged = $staged"
-          if ($staged -lt 50) { throw "staging incomplete: $staged" }
+          if ($staged -lt 50) { throw "暂存不完整: $staged" }
 
+          # ================= 图标：从 source.png 现生成 =================
+          # 关键：targetsize 资产的前缀必须是清单里引用的名字（Square44x44Logo），
+          # 用 AppList.* 是无效的 —— 清单从不引用 AppList，Windows 不会去读。
           $a = "$s\Assets"
           New-Item -ItemType Directory -Force -Path $a | Out-Null
-          $ic = "$env:GITHUB_WORKSPACE\.github\store-icons"
-          $zip = Join-Path $ic "appx-icons.zip"
-          if (Test-Path $zip) {
-            Expand-Archive -Path $zip -DestinationPath $a -Force
-            Write-Host "icons from appx-icons.zip"
-          } else {
-            Get-ChildItem $ic -File -Filter *.png -ErrorAction SilentlyContinue |
-              ForEach-Object { Copy-Item $_.FullName (Join-Path $a $_.Name) -Force }
-            Write-Host "icons from individual png"
+          $srcIcon = "$env:GITHUB_WORKSPACE\.github\store-icons\source.png"
+          if (-not (Test-Path $srcIcon)) {
+            # 没放自定义图标时，直接取上游官方 app_icon.png（按 release tag 固定版本）。
+            # 这样不放图标也能开箱即用，且永远与官方版本一致；
+            # 想换图标时，往 .github/store-icons/source.png 放一张即可覆盖。
+            $upTag = "${{ needs.check.outputs.tag }}"
+            $fb    = "$env:RUNNER_TEMP\source.png"
+            $fbUrl = "https://raw.githubusercontent.com/CyrilPeng/Venera-Next/$upTag/assets/app_icon.png"
+            Write-Host "source.png 未提供，改用上游官方图标: $fbUrl"
+            curl.exe -L --retry 5 --retry-delay 3 --retry-all-errors --max-time 300 -o $fb $fbUrl
+            if (-not (Test-Path $fb) -or (Get-Item $fb).Length -lt 5000) {
+              throw "source.png 未提供，且上游官方图标下载失败: $fbUrl"
+            }
+            $srcIcon = $fb
           }
-          $iconN = @(Get-ChildItem $a -Recurse -File -Force).Count
+          Write-Host "generating icons from $srcIcon"
+          Add-Type -AssemblyName System.Drawing
+
+          # 品牌底色下面会从源图自动采样（不再写死），用于宽磁贴/启动画面的留白填充
+          $BRAND = [System.Drawing.Color]::FromArgb(255, 14, 21, 34)
+          $brandHex = "#0E1522"
+
+          $srcImg = $null
+          try {
+            # .NET 对损坏/非图片文件会抛 OutOfMemoryException（信息误导），换算成可读原因
+            try {
+              $srcImg = [System.Drawing.Image]::FromFile($srcIcon)
+            } catch {
+              $fi = Get-Item $srcIcon -ErrorAction SilentlyContinue
+              $head = ""
+              try {
+                $raw = [IO.File]::ReadAllBytes($srcIcon)
+                $head = (($raw[0..([Math]::Min(11, $raw.Length-1))] | ForEach-Object { $_.ToString("X2") }) -join " ")
+              } catch { }
+              throw ("source.png 无法作为图片打开（文件可能损坏或不是图片格式）。大小=" +
+                     $(if ($fi) { $fi.Length } else { "?" }) + " 字节，文件头=" + $head +
+                     "，原始错误=" + $_.Exception.Message)
+            }
+            Write-Host ("source: {0}x{1}" -f $srcImg.Width, $srcImg.Height)
+            if ($srcImg.Width -lt 256 -or $srcImg.Height -lt 256) {
+              Write-Host "::warning::source.png 小于 256px，生成的图标可能模糊"
+            }
+
+            # 自动采样品牌底色：取四条边中点（避开中央 logo），再取平均（避开渐变极值）。
+            # 这样上游若换图标配色，宽磁贴与清单背景会自动跟上，不会出现色块拼接。
+            # 注意：坐标先算好再放进数组 —— 直接写 @($probe.Width - 3, ...) 
+            # 会被 PowerShell 解析成「数组减数字」而报 op_Subtraction 错误。
+            $probe = New-Object System.Drawing.Bitmap($srcIcon)
+            $pw = $probe.Width; $ph = $probe.Height
+            $cx = [int]($pw / 2); $cy = [int]($ph / 2)
+            $pts = @()
+            $pts += ,@(2, $cy)
+            $pts += ,@($cx, 2)
+            $pts += ,@(($pw - 3), $cy)
+            $pts += ,@($cx, ($ph - 3))
+            $samples = @()
+            foreach ($pt in $pts) {
+              if ($pt[0] -ge 0 -and $pt[0] -lt $pw -and $pt[1] -ge 0 -and $pt[1] -lt $ph) {
+                $c = $probe.GetPixel($pt[0], $pt[1])
+                if ($c.A -gt 200) { $samples += $c }
+              }
+            }
+            $probe.Dispose()
+            if ($samples.Count -gt 0) {
+              $r = [int](($samples | Measure-Object -Property R -Average).Average)
+              $g = [int](($samples | Measure-Object -Property G -Average).Average)
+              $b = [int](($samples | Measure-Object -Property B -Average).Average)
+              $BRAND = [System.Drawing.Color]::FromArgb(255, $r, $g, $b)
+            } else {
+              Write-Host "::warning::无法采样品牌底色，回退到 #0E1522"
+            }
+            $brandHex = "#{0:X2}{1:X2}{2:X2}" -f $BRAND.R, $BRAND.G, $BRAND.B
+            Write-Host ("brand color = {0} (auto-sampled)" -f $brandHex)
+
+            # ---------- 把圆角补成方角（方方正正铺满正方形）----------
+            # 官方图标四角是透明的（圆角设计），所以任务栏/开始菜单看起来是圆角块。
+            # 这里按行把左右两侧最近的实心像素向外延伸，填掉透明区域 ——
+            # 比单色填充好：不会在源图的竖直渐变上留下色块接缝。
+            $drawSrc = New-Object System.Drawing.Bitmap($srcIcon)
+            $fw = $drawSrc.Width; $fh = $drawSrc.Height
+            $fillRect = New-Object System.Drawing.Rectangle(0, 0, $fw, $fh)
+            $bits = $drawSrc.LockBits($fillRect,
+                      [System.Drawing.Imaging.ImageLockMode]::ReadWrite,
+                      [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            try {
+              $stride = $bits.Stride
+              $buf = New-Object byte[] ($stride * $fh)
+              [System.Runtime.InteropServices.Marshal]::Copy($bits.Scan0, $buf, 0, $buf.Length)
+              $filled = 0
+              for ($y = 0; $y -lt $fh; $y++) {
+                $row = $y * $stride
+                $lx = -1; $rx = -1
+                for ($x = 0; $x -lt $fw; $x++) {
+                  if ($buf[$row + $x * 4 + 3] -gt 200) {
+                    if ($lx -lt 0) { $lx = $x }
+                    $rx = $x
+                  }
+                }
+                if ($lx -lt 0) { continue }
+                for ($x = 0; $x -lt $lx; $x++) {
+                  $o = $row + $x * 4; $s = $row + $lx * 4
+                  $buf[$o] = $buf[$s]; $buf[$o+1] = $buf[$s+1]; $buf[$o+2] = $buf[$s+2]; $buf[$o+3] = 255
+                  $filled++
+                }
+                for ($x = $rx + 1; $x -lt $fw; $x++) {
+                  $o = $row + $x * 4; $s = $row + $rx * 4
+                  $buf[$o] = $buf[$s]; $buf[$o+1] = $buf[$s+1]; $buf[$o+2] = $buf[$s+2]; $buf[$o+3] = 255
+                  $filled++
+                }
+              }
+              [System.Runtime.InteropServices.Marshal]::Copy($buf, 0, $bits.Scan0, $buf.Length)
+              Write-Host ("已把 {0} 个透明像素补成方角（源图 {1}x{2}）" -f $filled, $fw, $fh)
+            } finally {
+              $drawSrc.UnlockBits($bits)
+            }
+
+            # $Fit=$true  -> 留白模式（宽磁贴/启动画面）：填品牌色，logo 居中不裁切
+            # $Fit=$false -> 铺满模式（方形资产）：方角源图直接 cover 缩放，铺满整个方块
+            function New-Icon([string]$Path, [int]$W, [int]$H, [bool]$Fit) {
+              $bmp = New-Object System.Drawing.Bitmap($W, $H, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.InterpolationMode  = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+              $g.PixelOffsetMode    = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+              $g.SmoothingMode      = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+              $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+              $sw = $drawSrc.Width; $sh = $drawSrc.Height
+              if ($Fit) {
+                $g.Clear($BRAND)
+                $target = [Math]::Min($W, $H) * 0.70
+                $scale  = $target / [double][Math]::Max($sw, $sh)
+                $nw = [Math]::Max(1, [int][Math]::Round($sw * $scale))
+                $nh = [Math]::Max(1, [int][Math]::Round($sh * $scale))
+                $x = [int](($W - $nw) / 2); $y = [int](($H - $nh) / 2)
+                $dst = New-Object System.Drawing.Rectangle($x, $y, $nw, $nh)
+                $g.DrawImage($drawSrc, $dst)
+              } else {
+                # 铺满：源图已补成方角，用品牌色打底再 cover 缩放，
+                # 连缩放产生的半透明边缘也会融进背景，不会露出底板。
+                $g.Clear($BRAND)
+                $scale = [Math]::Max($W / [double]$sw, $H / [double]$sh)
+                $nw = [Math]::Max($W, [int][Math]::Round($sw * $scale))
+                $nh = [Math]::Max($H, [int][Math]::Round($sh * $scale))
+                $left = [int](($nw - $W) / 2); $top = [int](($nh - $H) / 2)
+                $dst = New-Object System.Drawing.Rectangle(-$left, -$top, $nw, $nh)
+                $g.DrawImage($drawSrc, $dst)
+              }
+              $g.Dispose()
+              $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+              $bmp.Dispose()
+            }
+
+            New-Icon (Join-Path $a "StoreLogo.png")          50  50  $false
+            New-Icon (Join-Path $a "Square44x44Logo.png")    44  44  $false
+            New-Icon (Join-Path $a "Square71x71Logo.png")    71  71  $false
+            New-Icon (Join-Path $a "Square150x150Logo.png") 150 150  $false
+            New-Icon (Join-Path $a "Square310x310Logo.png") 310 310  $false
+            New-Icon (Join-Path $a "Wide310x150Logo.png")   310 150  $true
+            New-Icon (Join-Path $a "SplashScreen.png")      620 300  $true
+            New-Icon (Join-Path $a "BadgeLogo.png")          24  24  $false
+
+            $sizes = @(16,20,24,30,32,36,40,48,60,64,72,80,96,256)
+            foreach ($t in $sizes) {
+              foreach ($suf in @("", "_altform-unplated", "_altform-lightunplated")) {
+                New-Icon (Join-Path $a ("Square44x44Logo.targetsize-$t$suf.png")) $t $t $false
+              }
+            }
+          } finally {
+            if ($srcImg) { $srcImg.Dispose() }
+            if ($drawSrc) { $drawSrc.Dispose() }
+          }
+
+          $iconN = @(Get-ChildItem $a -Recurse -File -Force -ErrorAction SilentlyContinue).Count
           Write-Host "icons = $iconN"
-          if ($iconN -lt 40) { throw "too few icons: $iconN" }
-          foreach ($n in @("StoreLogo.png","Square44x44Logo.png","Square150x150Logo.png","Square310x310Logo.png","Square71x71Logo.png","Wide310x150Logo.png","SplashScreen.png","BadgeLogo.png","AppList.png")) {
-            if (-not (Test-Path (Join-Path $a $n))) { throw "required icon missing: $n" }
-          }
-          foreach ($t in @(16,20,24,30,32,36,40,48,60,64,72,80,96,256)) {
+          if ($iconN -lt 50) { throw "图标过少: $iconN (期望 50)" }
+          $need = @("StoreLogo.png","Square44x44Logo.png","Square150x150Logo.png","Square310x310Logo.png",
+                    "Square71x71Logo.png","Wide310x150Logo.png","SplashScreen.png","BadgeLogo.png")
+          foreach ($n in $need) { if (-not (Test-Path (Join-Path $a $n))) { throw "缺少图标: $n" } }
+          $sizes = @(16,20,24,30,32,36,40,48,60,64,72,80,96,256)
+          foreach ($t in $sizes) {
             foreach ($suf in @("","_altform-unplated","_altform-lightunplated")) {
-              $fn = "AppList.targetsize-$t$suf.png"
-              if (-not (Test-Path (Join-Path $a $fn))) { throw "AppList targetsize missing: $fn" }
+              $fn = "Square44x44Logo.targetsize-$t$suf.png"
+              if (-not (Test-Path (Join-Path $a $fn))) { throw "缺少 targetsize 资产: $fn" }
             }
           }
-          Write-Host "all AppList targetsize assets present (14 sizes x 3 themes)"
+          Write-Host "all required icon assets present (8 base + 42 targetsize)"
 
+          # ================= 清单 =================
           $pdn = [char]0xD835 + [char]0xDD78 + 'ik' + [char]0x0E19 + [char]0x795E + [char]0x6559 + [char]0x2728 + [char]0x6559 + [char]0x4E3B
           $x = @(
             '<?xml version="1.0" encoding="utf-8"?>'
@@ -268,7 +576,7 @@ jobs:
             '  </Resources>'
             '  <Applications>'
             '    <Application Id="App" Executable="VeneraNext.exe" EntryPoint="Windows.FullTrustApplication">'
-            '      <uap:VisualElements DisplayName="Venera漫画" Description="Venera漫画 - 跨平台漫画阅读器" BackgroundColor="#15293D" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">'
+            ('      <uap:VisualElements DisplayName="Venera漫画" Description="Venera漫画 - 跨平台漫画阅读器" BackgroundColor="' + $brandHex + '" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">')
             '        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square310x310Logo="Assets\Square310x310Logo.png" Square71x71Logo="Assets\Square71x71Logo.png">'
             '          <uap:ShowNameOnTiles>'
             '            <uap:ShowOn Tile="square150x150Logo" />'
@@ -286,141 +594,313 @@ jobs:
             '    <rescap:Capability Name="runFullTrust" />'
             '  </Capabilities>'
             '  <mp:PhoneIdentity PhoneProductId="926903e4-7b05-4c92-b01b-6c25d2f4a335" PhonePublisherId="1bf42279-ce31-40ab-8b3e-fcd19d939971" />'
-          '</Package>'
+            '</Package>'
           )
           [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
 
+          # ================= 生成 resources.pri =================
+          # 关键：Square44x44Logo.targetsize-* 是「限定符资源」。
+          # 没有 resources.pri，Windows 无法解析 TargetSize/Theme 限定符，
+          # 只能退回「缩小图标 + 画底板」的渲染方式 —— 这就是任务栏出现底板的原因。
+          $priOk = $false
+          $mp = Find-Kit "makepri.exe"
+          if ($mp -and (Test-Path $mp)) {
+            Write-Host "makepri = $mp"
+            $pricfgLines = @(
+              '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+              '<resources targetOsVersion="10.0.0" majorVersion="1">',
+              '  <packaging>',
+              '    <autoResourcePackage qualifier="Language"/>',
+              '    <autoResourcePackage qualifier="Scale"/>',
+              '    <autoResourcePackage qualifier="DXFeatureLevel"/>',
+              '  </packaging>',
+              '  <index root="\" startIndexAt="\">',
+              '    <default>',
+              '      <qualifier name="Language" value="en-US"/>',
+              '      <qualifier name="Contrast" value="standard"/>',
+              '      <qualifier name="Scale" value="100"/>',
+              '      <qualifier name="HomeRegion" value="001"/>',
+              '      <qualifier name="TargetSize" value="256"/>',
+              '      <qualifier name="LayoutDirection" value="LTR"/>',
+              '      <qualifier name="Theme" value="dark"/>',
+              '      <qualifier name="AlternateForm" value=""/>',
+              '      <qualifier name="DXFeatureLevel" value="DX9"/>',
+              '      <qualifier name="Configuration" value=""/>',
+              '      <qualifier name="DeviceFamily" value="Universal"/>',
+              '      <qualifier name="Custom" value=""/>',
+              '    </default>',
+              '    <indexer-config type="folder" foldernameAsQualifier="true" filenameAsQualifier="true" qualifierDelimiter="."/>',
+              '    <indexer-config type="resw" convertDotsToSlashes="true" initialPath=""/>',
+              '    <indexer-config type="resjson" initialPath=""/>',
+              '    <indexer-config type="PRI"/>',
+              '  </index>',
+              '</resources>'
+            )
+            $cfgPath = "$s\priconfig.xml"
+            try {
+              [IO.File]::WriteAllText($cfgPath, ($pricfgLines -join "`n"), (New-Object Text.UTF8Encoding $false))
+              $priPath = "$s\resources.pri"
+              $priLog = & $mp new /pr $s /cf $cfgPath /mn "$s\AppxManifest.xml" /of $priPath /o 2>&1 | Out-String
+              $cand = ($priLog -split "`n" | Where-Object { $_ -match "Resource Candidates" } | ForEach-Object { $_.Trim() }) -join " "
+              Write-Host "makepri: $cand"
+              if (-not (Test-Path $priPath)) {
+                Write-Host "::warning::resources.pri 未生成，任务栏图标可能仍有底板"
+                $priLog -split "`n" | ForEach-Object { if ($_.Trim()) { Write-Host "   " + $_.Trim() } }
+              } else {
+                $priOk = $true
+                Write-Host "resources.pri = $((Get-Item $priPath).Length) bytes"
+                # 关键补充校验：只「生成了 pri」不等于「索引成功」。
+                # 若 startIndexAt 或限定符配置有误，makepri 会产出一个空壳 pri，
+                # 图标照样退回「缩小 + 底板」。所以这里 dump 出来数一下 targetsize 条目。
+                $dumpPath = "$env:RUNNER_TEMP\pri-dump.xml"
+                Remove-Item $dumpPath -Force -ErrorAction SilentlyContinue
+                & $mp dump /if $priPath /of $dumpPath /o 2>&1 | Out-Null
+                if (Test-Path $dumpPath) {
+                  $dumpText = Get-Content $dumpPath -Raw
+                  $hits = ([regex]::Matches($dumpText, [regex]::Escape("targetsize-"))).Count
+                  Write-Host "pri 内 targetsize 条目 = $hits"
+                  if ($hits -lt 10) {
+                    throw ("resources.pri 里 targetsize 条目过少（$hits）—— 限定符图标没被索引，" +
+                           "任务栏会出现底板。已中止，避免发布坏包。")
+                  }
+                } else {
+                  Write-Host "::warning::makepri dump 未产出，跳过 pri 内容校验"
+                }
+              }
+            } finally {
+              Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
+            }
+          } else {
+            Write-Host "::warning::未找到 makepri.exe，跳过 resources.pri 生成"
+          }
+          if (-not $priOk) { Write-Host "::warning::pri=False —— 图标可能显示底板，但仍会继续构建" }
+          Write-Host "=== pri=$priOk ==="
+
+          # ================= 打包 =================
           $out = "C:\out"
           if (Test-Path $out) { Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path $out | Out-Null
 
-          # 第 1 步: pack 成 .msix
-          & $mk pack /d $s /p "$out\v.appx" /o 2>&1 | Tee-Object v.log
-          if (-not (Test-Path "$out\v.appx")) { Get-Content v.log | Select-Object -Last 8; throw "pack failed" }
+          Write-Host "=== makeappx pack (.appx) ==="
+          & $mk pack /d $s /p "$out\v.appx" /o 2>&1 | Tee-Object "$out\pack.log"
+          if (-not (Test-Path "$out\v.appx")) {
+            Write-Host "=== makeappx 输出尾部 ==="
+            Get-Content "$out\pack.log" | Select-Object -Last 15 | ForEach-Object { Write-Host "   $_" }
+            throw "makeappx pack 失败"
+          }
           $msixMB = [math]::Round((Get-Item "$out\v.appx").Length/1MB,1)
-          Write-Host "*** msix OK $msixMB MB ver=$v ***"
+          Write-Host "*** appx OK $msixMB MB ver=$v ***"
 
-          # 第 2 步: bundle 成 .msixbundle
-          # 商店要求: 此应用上次提交用的是 msixbundle, 后续必须继续用 bundle
-          # 官方命令: makeappx bundle /d <dir> /p <out>.msixbundle
-          Write-Host "=== 打包 .msixbundle ==="
+          # ================= 打包后复核成品 =================
+          # 前面验的是「打包前的暂存目录」，这里验「真正要上传的成品」——
+          # 确认 pri 与图标确实进了包，避免发布一个装上去没图标的包。
+          Write-Host "=== 解包复核成品 ==="
+          $vk = "$env:RUNNER_TEMP\verify"
+          if (Test-Path $vk) { Remove-Item $vk -Recurse -Force -ErrorAction SilentlyContinue }
+          $vlog = & $mk unpack /p "$out\v.appx" /d $vk /o 2>&1 | Out-String
+          if (-not (Test-Path "$vk\AppxManifest.xml")) {
+            Write-Host "::error::解包复核失败：成品包里没有 AppxManifest.xml"
+            $vlog -split "`n" | Select-Object -Last 10 | ForEach-Object { Write-Host "   $_" }
+            throw "解包复核失败"
+          }
+          if (-not (Test-Path "$vk\resources.pri")) {
+            throw "解包复核失败：成品包里没有 resources.pri —— 图标会出现底板"
+          }
+          $vAssets = @(Get-ChildItem "$vk\Assets" -File -ErrorAction SilentlyContinue).Count
+          $vPriKB  = [math]::Round((Get-Item "$vk\resources.pri").Length/1KB,1)
+          Write-Host "  AppxManifest.xml  ok"
+          Write-Host ("  resources.pri     ok ({0} KB)" -f $vPriKB)
+          Write-Host ("  Assets            {0} 个" -f $vAssets)
+          if ($vAssets -lt 50) { throw "解包复核失败：成品包里 Assets 只有 $vAssets 个" }
+          Remove-Item $vk -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "成品复核通过"
+
+          Write-Host "=== makeappx bundle (.msixbundle) ==="
+          # 商店要求: 此应用上次提交用的是 msixbundle，后续必须继续用 bundle
           $bd = "C:\B"
           if (Test-Path $bd) { Remove-Item $bd -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path $bd | Out-Null
           Copy-Item "$out\v.appx" (Join-Path $bd "Venera.msix") -Force
-          & $mk bundle /d $bd /p "$out\v.msixbundle" /o 2>&1 | Tee-Object b.log
-          if (-not (Test-Path "$out\v.msixbundle")) { Get-Content b.log | Select-Object -Last 8; throw "bundle failed" }
+          & $mk bundle /d $bd /p "$out\v.msixbundle" /o 2>&1 | Tee-Object "$out\bundle.log"
+          if (-not (Test-Path "$out\v.msixbundle")) {
+            Write-Host "=== makeappx bundle 输出尾部 ==="
+            Get-Content "$out\bundle.log" | Select-Object -Last 15 | ForEach-Object { Write-Host "   $_" }
+            throw "makeappx bundle 失败"
+          }
           $mb = [math]::Round((Get-Item "$out\v.msixbundle").Length/1MB,1)
           Write-Host "*** bundle OK $mb MB ver=$v ***"
-          if ($mb -lt 10) { throw "bundle too small: $mb MB" }
+          if ($mb -lt 10) { throw "msixbundle 过小: $mb MB" }
 
           if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
           Copy-Item "$out\v.msixbundle" "dist\Venera.msixbundle" -Force
-          "ver=$v" | Out-File -Append $env:GITHUB_OUTPUT
-          "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
-          "icons=$iconN" | Out-File -Append $env:GITHUB_OUTPUT
+          # 同时保留裸 .appx 作为兜底：万一商店不认 bundle，还能用这个试
+          Copy-Item "$out\v.appx" "dist\Venera.appx" -Force
+
+          "ver=$v"        | Out-File -Append $env:GITHUB_OUTPUT
+          "mb=$mb"        | Out-File -Append $env:GITHUB_OUTPUT
+          "icons=$iconN"  | Out-File -Append $env:GITHUB_OUTPUT
+          "pri=$priOk"    | Out-File -Append $env:GITHUB_OUTPUT
+
       - name: Publish Release (latest)
         id: rel
-        if: success()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $repo = "${{ github.repository }}"
-          $tag = "latest"
-          $v = "${{ steps.pack.outputs.ver }}"
-          $up = "${{ needs.check.outputs.ver }}"
-          gh release delete $tag --repo $repo --yes --cleanup-tag 2>$null
-          gh release create $tag "dist\Venera.msixbundle" `
-            --repo $repo `
-            --title "Venera漫画 $up（MSIX $v）" `
-            --notes "上游版本: $up (build ${{ needs.check.outputs.build }})`nMSIX 版本: $v`nicons: ${{ steps.pack.outputs.icons }}`nfrom: CyrilPeng/Venera-Next"
-          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          $tag  = "latest"
+          $v    = "${{ steps.pack.outputs.ver }}"
+          $up   = "${{ needs.check.outputs.ver }}"
+          $title = "Venera漫画 $v（最新）"
+          $notes = "版本: $v`n上游版本: $up (build ${{ needs.check.outputs.build }})`n本次触发: ${{ needs.check.outputs.reason }}`nicons: ${{ steps.pack.outputs.icons }}`npri: ${{ steps.pack.outputs.pri }}`nfrom: CyrilPeng/Venera-Next"
+
+          # 不再「删除再重建」——那样会让下载链接出现约 2 秒的 404 窗口。
+          # 改成：不存在才创建；存在则用 --clobber 原地覆盖资源。
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "release 不存在，创建 $tag"
+            gh release create $tag --repo $repo --title $title --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "gh release create 失败" }
+          } else {
+            Write-Host "release 已存在，原地覆盖资源"
+          }
+
+          gh release upload $tag "dist\Venera.msixbundle" --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw "上传 Venera.msixbundle 失败" }
+          Write-Host "已上传 Venera.msixbundle"
+
+          gh release upload $tag "dist\Venera.appx" --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::上传 .appx 兜底资源失败（不影响 bundle）" }
+          else { Write-Host "已上传 Venera.appx（兜底）" }
+
+          gh release edit $tag --repo $repo --title $title --notes $notes
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::更新 release 说明失败" }
+
           $url = "https://github.com/$repo/releases/download/$tag/Venera.msixbundle"
           Write-Host "DIRECT URL = $url"
           "url=$url" | Out-File -Append $env:GITHUB_OUTPUT
+
       - name: Upload artifact (fallback only)
         if: steps.rel.outcome != 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: venera-msixbundle
           path: dist/*
           if-no-files-found: warn
+          overwrite: true
           retention-days: 7
+
       - name: Save version
-        if: success()
+        # 只有发布成功才记录指纹，否则一次发布失败会让这个版本被永久跳过。
+        # 指纹直接复用 check job 的输出 —— 不在 Windows 上重算哈希。
+        # 若在两端各算一次，行尾转换(CRLF)会让哈希不一致，导致每天重复构建。
+        if: steps.rel.outcome == 'success'
         continue-on-error: true
         run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
-          echo "${{ needs.check.outputs.tag }}" > .venera-ver
+          $fp = "${{ needs.check.outputs.tag }}|${{ needs.check.outputs.zipsize }}|${{ needs.check.outputs.zupd }}|${{ needs.check.outputs.iconhash }}|${{ needs.check.outputs.wfhash }}"
+          Write-Host "fingerprint = $fp"
+          [IO.File]::WriteAllText("$PWD\.venera-ver", $fp, (New-Object Text.UTF8Encoding $false))
           git add .venera-ver
-          git diff --cached --quiet && echo "unchanged" && exit 0
-          git commit -m "venera tag [skip ci]"
-          git pull --rebase --autostash origin main || echo "rebase failed"
-          git push || echo "push failed"
+          git diff --cached --quiet; if ($LASTEXITCODE -eq 0) { Write-Host "unchanged"; exit 0 }
+          git commit -m "venera ver [skip ci]"
+          git pull --rebase --autostash origin main; if ($LASTEXITCODE -ne 0) { Write-Host "::warning::rebase 失败" }
+          git push; if ($LASTEXITCODE -ne 0) { Write-Host "::warning::push 失败（指纹未保存，下次会重复构建）" }
+
       - name: Email success
         if: success()
         shell: pwsh
         run: |
-          $url = "${{ steps.rel.outputs.url }}"
-          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          if (-not $url) { $url = "(Release 未生成，请到 Actions 页下载 artifact)`n$runUrl" }
-          $L = @(
-            "Venera漫画 新包已构建完成。",
-            "",
-            "上游版本: ${{ needs.check.outputs.tag }} (build ${{ needs.check.outputs.build }})",
-            "MSIX 版本: ${{ steps.pack.outputs.ver }}",
-            "大小: ${{ steps.pack.outputs.mb }} MB",
-            "图标: ${{ steps.pack.outputs.icons }} 个（含全部 targetsize 三主题）",
-            "",
-            "===== 第 1 步：下载 =====",
-            "",
-            "点这个链接（浏览器立即开始下载，永远是最新版）：",
-            "",
-            $url,
-            "",
-            "===== 第 2 步：上传商店 =====",
-            "",
-            "打开下面链接（直达 Venera漫画 页面）：",
-            "https://partner.microsoft.com/zh-cn/dashboard/products/9P8TVBWFVX8Z/overview",
-            "",
-            "然后：",
-            "  1. 点右上角的【更新】按钮",
-            "  2. 上传刚下载的 Venera.msixbundle",
-            "  3. 提交认证（约 3 个工作日）",
-            "",
-            "-- GitHub Actions 自动发送"
-          )
-          $body = $L -join "`r`n"
-          $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
-          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[Venera] 新版本已就绪，可以发布到商店了" -Body $body -Encoding UTF8 -Credential $cred
-          Write-Host "success mail sent"
-      - name: Email failure
-        if: failure()
+          # 注意：Send-MailMessage 抛的是非终止性错误，必须加 -ErrorAction Stop 才能进 catch。
+          # 这样“没收到邮件”时能在 Annotations 里查到确切原因。
+          try {
+            $url    = "${{ steps.rel.outputs.url }}"
+            $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            if (-not $url) { $url = "(Release 未生成，请到 Actions 页下载 artifact)`n$runUrl" }
+            $L = @(
+              "Venera漫画 新包已构建完成。",
+              "",
+              "MSIX 版本: ${{ steps.pack.outputs.ver }}",
+              "上游版本: ${{ needs.check.outputs.tag }} (build ${{ needs.check.outputs.build }})",
+              "本次触发: ${{ needs.check.outputs.reason }}",
+              "大小: ${{ steps.pack.outputs.mb }} MB",
+              "图标: ${{ steps.pack.outputs.icons }} 个    pri: ${{ steps.pack.outputs.pri }}",
+              "",
+              "===== 第 1 步：下载 =====",
+              "",
+              "点这个链接（浏览器立即开始下载，永远是最新版）：",
+              "",
+              $url,
+              "",
+              "===== 第 2 步：上传商店 =====",
+              "",
+              "打开下面链接（直达 Venera漫画 页面）：",
+              "https://partner.microsoft.com/zh-cn/dashboard/products/9P8TVBWFVX8Z/overview",
+              "",
+              "然后：",
+              "  1. 点右上角的【更新】按钮",
+              "  2. 上传刚下载的 Venera.msixbundle",
+              "     （万一商店提示包格式问题，Release 页还有一个 Venera.appx 可试）",
+              "  3. 提交认证（约 3 个工作日）",
+              "",
+              "-- GitHub Actions 自动发送"
+            )
+            $body = $L -join "`r`n"
+            $sec  = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
+            $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
+            Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl `
+              -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" `
+              -Subject "[Venera] 新版本已就绪，可以发布到商店了" `
+              -Body $body -Encoding UTF8 -Credential $cred -ErrorAction Stop
+            Write-Host "::notice title=Mail-OK::成功邮件已发送"
+          } catch {
+            Write-Host "::warning title=Mail-FAILED::成功邮件发送失败：$($_.Exception.Message)"
+          }
+
+  # ============================================================
+  notify: 失败时发邮件（独立 job —— check 失败时 build 会被跳过，
+  #         放在 build 里的失败邮件永远不会执行）
+  # ============================================================
+  notify:
+    needs: [check, build]
+    if: failure()
+    runs-on: windows-2025
+    timeout-minutes: 10
+    defaults:
+      run:
         shell: pwsh
+    steps:
+      - name: Email failure
         run: |
-          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          $L = @(
-            "Venera 自动构建失败了，需要你检查一下。",
-            "",
-            "上游 tag: ${{ needs.check.outputs.tag }}",
-            "",
-            "常见原因:",
-            "  1. 上游改了资产命名或 zip 结构（规律失效）",
-            "  2. 下载失败或大小不符",
-            "  3. makeappx 打包失败",
-            "  4. 图标缺失（.github/store-icons/）",
-            "",
-            "查看日志:",
-            $runUrl,
-            "",
-            "-- GitHub Actions 自动发送"
-          )
-          $body = $L -join "`r`n"
-          $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
-          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[Venera] 构建失败，需要检查" -Body $body -Encoding UTF8 -Credential $cred
-          Write-Host "failure mail sent"
+          try {
+            $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            $L = @(
+              "Venera 自动构建失败了，需要你检查一下。",
+              "",
+              "check 结果: ${{ needs.check.result }}",
+              "build 结果: ${{ needs.build.result }}",
+              "",
+              "常见原因:",
+              "  1. 上游改了资产命名或 zip 结构（VeneraNext-<ver>-windows.zip 规律失效）",
+              "  2. 下载失败或大小不符",
+              "  3. makeappx / makepri 失败",
+              "  4. 图标缺失或损坏（.github/store-icons/source.png）",
+              "",
+              "查看日志:",
+              $runUrl,
+              "",
+              "-- GitHub Actions 自动发送"
+            )
+            $body = $L -join "`r`n"
+            $sec  = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
+            $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
+            Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl `
+              -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" `
+              -Subject "[Venera] 构建失败，需要检查" `
+              -Body $body -Encoding UTF8 -Credential $cred -ErrorAction Stop
+            Write-Host "::notice title=Mail-OK::失败邮件已发送"
+          } catch {
+            Write-Host "::warning title=Mail-FAILED::失败邮件发送失败：$($_.Exception.Message)"
+          }
